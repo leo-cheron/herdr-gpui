@@ -191,3 +191,20 @@ During fast scrolling a slide trails the daemon by at most about 1.5 render
 intervals (about 26 ms); a slow momentum tail trails by up to 1.5 of its own
 step gaps. The live surface, used for input and selection, is never delayed.
 Scrollbar drags are direct manipulation and never slide.
+
+Cost: only the sliding pane's region repaints; other panes replay their cached
+scene, and nothing changes at rest. The price is frame count, since a slide draws
+every display frame rather than once per surface. Release builds on an Apple M1
+Max, macOS 26.6, Herdr 0.9.3, driving `pane.scroll` one line at a time at 120/s
+through the API socket, with CPU from `ps` and GPU from the process's
+`accumulatedGPUTime`. Each figure is the range of interleaved runs with the
+window on a 100/120 Hz display:
+
+| Build | Scrolling CPU | Scrolling GPU | Idle CPU |
+| --- | --- | --- | --- |
+| Without slides | 10-13% | 4.5-5.5% | ~2% |
+| With slides | 18-22% | 7-11.5% | ~2% |
+
+On a 60 Hz display, where frames and surfaces arrive at about the same rate, both
+measured 6-8% CPU and 2-3% GPU. Most of the extra main-thread time is Metal
+drawing and presenting the additional frames, not terminal painting.
