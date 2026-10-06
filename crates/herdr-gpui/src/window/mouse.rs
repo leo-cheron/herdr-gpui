@@ -418,8 +418,9 @@ impl HerdrWindow {
         let Some(drag) = &self.scrollbar_drag else {
             return;
         };
+        // A snapshot ahead of its surface leaves no bar for a moment: the drag
+        // waits it out, and the next move (macOS repeats a held one) resumes.
         let Some(bar) = self.scrollbar(&drag.pane) else {
-            self.scrollbar_drag = None;
             return;
         };
         let top = f32::from(position.y - self.bounds.origin.y) - drag.grab;

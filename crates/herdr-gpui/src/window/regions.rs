@@ -1,10 +1,12 @@
 //! The terminal grid painted as one cached view per pane, plus one for the
 //! cells around them, so an update repaints only the regions whose cells
 //! changed. One busy pane no longer reshapes every other pane on screen.
+//! A pane mid-slide (`smooth_scroll`) repaints every frame until it rests.
 
 use super::HerdrWindow;
 use crate::{
     config::Theme,
+    smooth_scroll::Slide,
     terminal_painter::{self, Highlight, Layer, Part, Span, TerminalPainter},
 };
 use gpui::{prelude::*, *};
@@ -36,12 +38,16 @@ struct Region {
     area: Vec<Span>,
     highlights: Vec<Highlight>,
     look: Look,
+    slide: Option<Slide>,
 }
 
 impl Region {
-    /// Whether `next` paints exactly what this region already painted.
+    /// Whether `next` paints exactly what this region already painted. A
+    /// slide moves with time, so a sliding region never does.
     fn paints_like(&self, next: &Self) -> bool {
-        self.area == next.area
+        self.slide.is_none()
+            && next.slide.is_none()
+            && self.area == next.area
             && self.highlights == next.highlights
             && self.look == next.look
             && (Arc::ptr_eq(&self.surface, &next.surface)
@@ -172,26 +178,145 @@ impl Render for RegionView {
         canvas(
             |_, _, _| (),
             move |bounds, _, window, cx| {
-                painter.borrow_mut().paint_frame(
-                    &region.surface.frame,
+                let mut painter = painter.borrow_mut();
+                let look = &region.look;
+                let mut paint = |frame: &FrameData,
+                                 origin: Point<Pixels>,
+                                 available: Option<Size<Pixels>>,
+                                 highlights: &[Highlight],
+                                 panes: &[PaneSurfacePane],
+                                 area: &[Span],
+                                 window: &mut Window| {
+                    painter.paint_frame(
+                        frame,
+                        origin,
+                        available,
+                        look.cell_width,
+                        &look.font,
+                        highlights,
+                        panes,
+                        Some(Part { area, layer }),
+                        None,
+                        window,
+                        cx,
+                    );
+                };
+                let surface = &region.surface;
+                let Some(slide) = &region.slide else {
+                    paint(
+                        &surface.frame,
+                        bounds.origin,
+                        Some(bounds.size),
+                        &region.highlights,
+                        &surface.panes,
+                        &region.area,
+                        window,
+                    );
+                    return;
+                };
+                // The pane's border stays put while its content slides inside
+                // it. Backgrounds paint at rest under the slide, so the
+                // sub-cell remainder past the grid's last row stays filled.
+                let rect = slide.rect;
+                let (inside, outside) = split(&region.area, rect);
+                let still = match layer {
+                    Layer::Backgrounds => &region.area,
+                    Layer::Text | Layer::Decorations => &outside,
+                };
+                paint(
+                    &surface.frame,
                     bounds.origin,
                     Some(bounds.size),
-                    region.look.cell_width,
-                    &region.look.font,
                     &region.highlights,
-                    &region.surface.panes,
-                    Some(Part {
-                        area: &region.area,
-                        layer,
-                    }),
-                    None,
+                    &surface.panes,
+                    still,
                     window,
-                    cx,
                 );
+                let (cell_width, cell_height) = (look.cell_width, look.cell_height);
+                // Whole device pixels, so every glyph rasterizes as it does at rest.
+                let scale = window.scale_factor();
+                let offset = (slide.offset * cell_height * scale).round() / scale;
+                let mask = Bounds::new(
+                    bounds.origin
+                        + point(
+                            px(f32::from(rect.x) * cell_width),
+                            px(f32::from(rect.y) * cell_height),
+                        ),
+                    size(
+                        px(f32::from(rect.width) * cell_width),
+                        px(f32::from(rect.height) * cell_height),
+                    ),
+                );
+                window.with_content_mask(Some(ContentMask { bounds: mask }), |window| {
+                    // Each earlier frame fills the edge rows the newer ones lack.
+                    let mut filled = 0;
+                    for (earlier, shift) in &slide.behind {
+                        let rows = u16::try_from(shift.abs_diff(filled))
+                            .unwrap_or(rect.height)
+                            .min(rect.height);
+                        filled = *shift;
+                        let band = SurfaceRect {
+                            y: if *shift > 0 {
+                                rect.y + rect.height - rows
+                            } else {
+                                rect.y
+                            },
+                            height: rows,
+                            ..rect
+                        };
+                        let y = offset + *shift as f32 * cell_height;
+                        paint(
+                            &earlier.frame,
+                            bounds.origin + point(px(0.), px(y)),
+                            None,
+                            &[],
+                            &[],
+                            &split(&region.area, band).0,
+                            window,
+                        );
+                    }
+                    paint(
+                        &surface.frame,
+                        bounds.origin + point(px(0.), px(offset)),
+                        None,
+                        &region.highlights,
+                        &surface.panes,
+                        &inside,
+                        window,
+                    );
+                });
             },
         )
         .size_full()
     }
+}
+
+/// The parts of `area` inside `rect`, and the parts outside it.
+fn split(area: &[Span], rect: SurfaceRect) -> (Vec<Span>, Vec<Span>) {
+    let rows = rect.y..rect.y.saturating_add(rect.height);
+    let columns = rect.x..rect.x.saturating_add(rect.width);
+    let (mut inside, mut outside) = (Vec::new(), Vec::new());
+    for span in area {
+        let start = span.columns.start.max(columns.start);
+        let end = span.columns.end.min(columns.end);
+        if !rows.contains(&span.row) || start >= end {
+            outside.push(span.clone());
+            continue;
+        }
+        inside.push(Span {
+            row: span.row,
+            columns: start..end,
+        });
+        for columns in [span.columns.start..start, end..span.columns.end] {
+            if !columns.is_empty() {
+                outside.push(Span {
+                    row: span.row,
+                    columns,
+                });
+            }
+        }
+    }
+    (inside, outside)
 }
 
 impl HerdrWindow {
@@ -208,6 +333,7 @@ impl HerdrWindow {
         &mut self,
         surface: Option<&Arc<PaneSurfaceFrame>>,
         highlights: &[Highlight],
+        mut slides: Vec<Slide>,
         look: &Look,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
@@ -217,12 +343,20 @@ impl HerdrWindow {
         };
         let mut previous = std::mem::take(&mut self.regions);
         for (owner, area) in partition(&surface.frame, &surface.panes) {
+            let slide = match &owner {
+                Owner::Pane(id) => slides
+                    .iter()
+                    .position(|slide| slide.pane_id == *id)
+                    .map(|index| slides.swap_remove(index)),
+                Owner::Chrome => None,
+            };
             let region = Rc::new(Region {
                 owner,
                 surface: surface.clone(),
                 highlights: terminal_painter::clip(highlights, &area),
                 area,
                 look: look.clone(),
+                slide,
             });
             let kept = previous
                 .iter()

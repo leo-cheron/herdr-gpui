@@ -16,7 +16,7 @@ use crate::{
 };
 use gpui::{prelude::*, *};
 use herdr_client::ConnectOptions;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The status bar's 24-unit SVG icons pad their artwork, so they are drawn at
 /// this size to look as large as the 12px ring of the report-issue button.
@@ -153,7 +153,21 @@ impl Render for HerdrWindow {
             cell_height,
             theme: self.theme.clone(),
         };
-        let regions = self.terminal_regions(surface.as_ref(), &highlights, &look, cx);
+        // Images paint with the whole grid, which never slides: they would
+        // stay put while the text moved. A dragged thumb places the content
+        // exactly where the pointer put it.
+        let animate = self.scrollbar_drag.is_none()
+            && surface
+                .as_ref()
+                .is_some_and(|surface| surface.graphics.placements.is_empty());
+        let slides = self.presentation.slides(Instant::now(), animate);
+        if !slides.is_empty() {
+            // Advance the slide on the next refresh through the surface signal:
+            // notifying this view would also rebuild the cached sidebar.
+            let signal = self.surface_signal.clone();
+            window.on_next_frame(move |_, cx| signal.update(cx, |_, cx| cx.notify()));
+        }
+        let regions = self.terminal_regions(surface.as_ref(), &highlights, slides, &look, cx);
         // Without regions the canvas paints the whole grid, images included.
         let whole = regions.is_empty();
         // The IME composition paints inline at the input cursor; a menu's

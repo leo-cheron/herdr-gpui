@@ -27,6 +27,7 @@ mod mouse_gestures;
 mod mouse_targets;
 mod prompts;
 mod reconnect_backoff;
+mod scrollbar_drag;
 mod sounds;
 mod split_drag;
 mod toast_handoff;
@@ -206,6 +207,7 @@ fn connected_endpoint(id: &str) -> (Endpoint, Server) {
             Method::PaneResize,
             Method::PaneSwap,
             Method::PaneClear,
+            Method::PaneScroll,
             Method::PaneClose,
             Method::TabClose,
             Method::CommandInvoke,

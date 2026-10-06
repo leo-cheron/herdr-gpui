@@ -166,3 +166,28 @@ entity-level scene caching, no daemon/protocol changes, and no new handling of
 terminal graphics/hyperlinks. Native checks exercise changed foregrounds, centered
 popup drawing, beam and underline cursors, and fresh/cached glyph equality; they
 are not a screenshot pixel-diff test or exhaustive Unicode/font-fallback suite.
+
+## Scrollback Cadence
+
+Scroll judder is not paint cost: a release `--performance-test` warm scroll paints
+at p50/p95 5.62/7.85 ms. It is the daemon's cadence. Herdr renders at most once per
+16 ms (`MIN_RENDER_INTERVAL`), so 1-line wheel events at 120 Hz against Herdr 0.9.3
+arrive as 116 surfaces for 240 inputs, gaps p50/p95 17.44/18.50 ms, mostly 2-row
+(1: 6, 2: 94, 3: 15) jumps out of phase with the display.
+
+`smooth_scroll` slides each verified whole-row shift back to rest over 1.5 step
+intervals, filling the uncovered edge from up to four earlier surfaces. A step
+interval is the daemon's smoothed cadence, or the gap since the previous step
+when that is longer (up to 200 ms), so a dying trackpad momentum keeps moving
+between its sparse steps. Replaying the recorded arrival timeline above, sampled
+at vsync, with cadence-only pacing (before the gap rule was added):
+
+| Display | Rows/frame SD, raw → slid | Max rows/frame | Frames without motion |
+| --- | --- | --- | --- |
+| 120 Hz | 1.079 → 0.184 | 3.00 → 1.34 | 121/231 → 0/231 |
+| 60 Hz | 0.593 → 0.394 | 3.00 → 2.69 | 5/108 → 0/108 |
+
+During fast scrolling a slide trails the daemon by at most about 1.5 render
+intervals (about 26 ms); a slow momentum tail trails by up to 1.5 of its own
+step gaps. The live surface, used for input and selection, is never delayed.
+Scrollbar drags are direct manipulation and never slide.

@@ -2104,6 +2104,17 @@ Windows setup) nothing is saved and the window says so.
   (inside its content, not borders). Fractional pixel motion accumulates into
   terminal lines, with bounded per-event work. Popups capture wheel input only
   within their displayed bounds; input never falls through to a covered pane.
+- The daemon presents at most one surface per render interval (16 ms), so a
+  gesture arrives as one-to-three-row scrollback jumps that do not line up with
+  the display. When the daemon's scroll metrics and the pane's rows both show a
+  whole-row shift, the pane slides into place at display rate over one and a
+  half step intervals, its uncovered edge filled from earlier surfaces. As a
+  trackpad's momentum dies and steps spread out, each slide stretches to the
+  gap before it, so the motion slows down rather than stuttering. This is
+  presentation only: input and selection target the live surface. Any other
+  change to the pane snaps, and a dragged scrollbar thumb, or a frame placing
+  images, moves the content without a slide. Only the sliding pane repaints
+  while it moves; other panes replay their cached paint.
 - Direct semantic cell canvas: named ANSI colors, indexed 256-color palette,
   RGB, reset foreground/background, reverse, dim, hidden, bold, italic,
   underline, strikeout, wide-cell skip handling, and cursor shapes.

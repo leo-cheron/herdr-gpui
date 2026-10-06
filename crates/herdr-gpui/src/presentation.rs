@@ -11,11 +11,15 @@
 //!
 //! Retained cells are presentation only. Hit testing, input routing, and IME
 //! placement keep reading `LiveState::surface`, so a retained frame can never
-//! aim a click or a keystroke at a pane the client has already left.
+//! aim a click or a keystroke at a pane the client has already left. The same
+//! holds for the scroll slides it paints between surfaces (`smooth_scroll`).
 
-use crate::state::LiveState;
+use crate::{
+    smooth_scroll::{Slide, SmoothScroll},
+    state::LiveState,
+};
 use herdr_client::{SurfaceImages, protocol::PaneSurfaceFrame};
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 /// A frame with the pixels for the images it places.
 #[derive(Clone)]
@@ -30,6 +34,7 @@ pub(crate) struct Presentation {
     /// The pixels the presented frame was shown with. A retained frame keeps
     /// them, since the connection's own set follows the newest surface.
     images: Arc<SurfaceImages>,
+    scroll: SmoothScroll,
     #[cfg(feature = "integration-test")]
     pub(crate) probe: Probe,
 }
@@ -41,6 +46,9 @@ impl Presentation {
     pub(crate) fn frame(&mut self, live: &LiveState) -> Option<Arc<PaneSurfaceFrame>> {
         match live.surface.clone().filter(|_| live.surface_ready()) {
             Some(ready) => {
+                if let Some(shown) = self.presented.as_ref().filter(|s| !Arc::ptr_eq(s, &ready)) {
+                    self.scroll.observe(shown, &ready, Instant::now());
+                }
                 self.presented = Some(ready);
                 self.images = live.surface_images.clone();
             }
@@ -72,11 +80,22 @@ impl Presentation {
                 .is_some_and(|snapshot| snapshot.boot_id == presented.boot_id)
     }
 
+    /// The panes to paint mid-slide at `now`, against the presented frame.
+    /// Without `animate`, as while the scrollbar is dragged, slides stop: the
+    /// content must sit exactly where the pointer put it.
+    pub(crate) fn slides(&mut self, now: Instant, animate: bool) -> Vec<Slide> {
+        if !animate {
+            self.scroll.clear();
+        }
+        self.scroll.slides(now)
+    }
+
     /// Forget the picture. Another connection's window is not this one's, so a
     /// reconnect, a detach, or a switch of endpoint starts from an empty area.
     pub(crate) fn clear(&mut self) {
         self.presented = None;
         self.images = Default::default();
+        self.scroll.clear();
     }
 
     /// The frame to paint now, as `frame` chooses it, with its images.
