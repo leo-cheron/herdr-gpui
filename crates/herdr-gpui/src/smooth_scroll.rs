@@ -296,13 +296,16 @@ fn rows_shifted(old: &FrameData, new: &FrameData, rect: SurfaceRect, shift: i32)
     };
     let overlap = top.max(top + shift)..bottom.min(bottom + shift);
     let rows = overlap.len();
+    if rows == 0 || rows * 2 < usize::from(rect.height) {
+        return false;
+    }
     let same = overlap
         .filter(|y| {
             let new = new.cells.get(row(*y));
             new.is_some() && new == old.cells.get(row(y - shift))
         })
         .count();
-    rows > 0 && rows * 2 >= usize::from(rect.height) && same * 4 >= rows * 3
+    same * 4 >= rows * 3
 }
 
 #[cfg(test)]
