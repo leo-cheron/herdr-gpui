@@ -4,22 +4,29 @@
 //! `origin`, the pane of the agent its notes go to. The review's state lives
 //! in the window: made when the tab is opened or first seen after a restart,
 //! and read off the UI thread from the window's tick, never from drawing.
-use super::{Agent, Layout, Review, State, agent_in, pick_agent, rows};
+use super::{Agent, Layout, Review, State, agent_in, pick_agent, rows, search};
 use crate::{
     HerdrWindow,
     browser::{Location, ReviewCheckout, Slot, Store, Tab, TabId},
     pull_request::Input,
-    search_input::SearchInput,
+    search_input::{self, SearchInput},
     window::Flash,
 };
 use gpui::{prelude::*, *};
-use std::collections::HashMap;
+use std::{
+    cell::Cell,
+    collections::{BTreeSet, HashMap, HashSet},
+};
 
 impl HerdrWindow {
     /// Opens the focused checkout's review tab in the group in use, or
     /// brings back the one already open, and reads its changes again.
     pub(crate) fn open_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(input) = self.git.tracked().cloned() else {
+        let Some(checkout) = self
+            .git
+            .tracked()
+            .and_then(|input| ReviewCheckout::try_from(input).ok())
+        else {
             self.show_flash(Flash::warning("No local checkout to review"), cx);
             return;
         };
@@ -38,7 +45,6 @@ impl HerdrWindow {
             return;
         };
         let scope = crate::browser::scope(&self.endpoints[self.selected_endpoint]);
-        let checkout = ReviewCheckout::from(&input);
         let agent = self.live.snapshot.as_deref().and_then(pick_agent);
         let existing = cx.try_global::<Store>().and_then(|store| {
             store
@@ -88,24 +94,23 @@ impl HerdrWindow {
         else {
             return false;
         };
-        let (ui, theme) = (self.config.ui.clone(), self.theme.clone());
-        let input = cx.new(|cx| {
-            let mut input = SearchInput::new(cx);
-            input.set_placeholder("Describe the change\u{2026}", cx);
-            input.set_appearance(ui, theme, cx);
-            input
-        });
-        self.reviews.insert(
-            id,
-            Review::new(
-                Input::from(&checkout),
-                agent,
-                self.selected_endpoint,
-                input,
-                cx.focus_handle(),
-            ),
-        );
+        let review = self.new_review(id, Input::from(&checkout), agent, cx);
+        self.reviews.insert(id, review);
         true
+    }
+
+    /// The review holding the keyboard, or one of its fields.
+    pub(crate) fn focused_review(&self, window: &Window, cx: &App) -> Option<TabId> {
+        self.reviews
+            .iter()
+            .find(|(_, review)| {
+                review.focus.contains_focused(window, cx)
+                    || review.files_focus.is_focused(window)
+                    || review.search.input.read(cx).focus.is_focused(window)
+                    || review.filter.read(cx).focus.is_focused(window)
+                    || review.input.read(cx).focus.is_focused(window)
+            })
+            .map(|(id, _)| *id)
     }
 
     /// Runs every window tick: review tabs of the focused workspace that
@@ -141,6 +146,7 @@ impl HerdrWindow {
                 self.load_review(id, cx);
             }
         }
+        self.follow_review_changes(cx);
     }
 
     /// A review tab, drawn in `slot` where a page would be.
@@ -178,43 +184,118 @@ impl HerdrWindow {
                     }
                 }),
             )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, _| this.release_review_code(id)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, _| this.release_review_code(id)),
+            )
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                // Only keys meant for the diff itself; fields keep theirs.
+                let Some(review) = this.reviews.get(&id) else {
+                    return;
+                };
+                if review.focus.is_focused(window) && this.review_key(id, event, window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            // The Edit menu's Copy and Select All, which replay their keys.
+            .when(review.selection.is_some_and(|s| !s.is_empty()), |tab| {
+                tab.on_action(
+                    cx.listener(move |this, _: &crate::actions::Copy, window, cx| {
+                        this.review_key(id, &crate::actions::edit_key("c"), window, cx);
+                    }),
+                )
+            })
+            .on_action(
+                cx.listener(move |this, _: &crate::actions::SelectAll, window, cx| {
+                    this.review_key(id, &crate::actions::edit_key("a"), window, cx);
+                }),
+            )
             .child(self.render_review(id, cx))
             .into_any_element()
     }
 }
 
-impl Review {
-    pub(super) fn new(
+impl HerdrWindow {
+    /// A review of `checkout` for tab `id`, its fields made and followed.
+    pub(super) fn new_review(
+        &mut self,
+        id: TabId,
         checkout: Input,
         agent: Option<Agent>,
-        endpoint: usize,
-        input: Entity<SearchInput>,
-        focus: FocusHandle,
-    ) -> Self {
-        Self {
+        cx: &mut Context<Self>,
+    ) -> Review {
+        let (ui, theme) = (self.config.ui.clone(), self.theme.clone());
+        let field = |placeholder: &'static str, cx: &mut Context<Self>| {
+            let (ui, theme) = (ui.clone(), theme.clone());
+            cx.new(|cx| {
+                let mut input = SearchInput::new(cx);
+                input.set_placeholder(placeholder, cx);
+                input.set_appearance(ui, theme, cx);
+                input
+            })
+        };
+        let input = field("Describe the change\u{2026}", cx);
+        let filter = field("Filter files\u{2026}", cx);
+        let search = field("Find in changes\u{2026}", cx);
+        let subscriptions = vec![
+            cx.subscribe(&filter, move |this, _, _: &search_input::Changed, cx| {
+                this.review_filter_changed(id, cx);
+            }),
+            cx.subscribe(&search, move |this, _, _: &search_input::Changed, cx| {
+                this.review_query_changed(id, cx);
+            }),
+        ];
+        Review {
             checkout,
             scope: super::Scope::default(),
             layout: Layout::default(),
-            split: Vec::new(),
+            ignore_whitespace: false,
             split_ratio: rows::EVEN_SPLIT,
-            files: Vec::new(),
-            file_items: Vec::new(),
-            files_scroll: UniformListScrollHandle::new(),
-            index: Default::default(),
             agent,
-            endpoint,
+            endpoint: self.selected_endpoint,
             state: State::Loading,
+            starts: vec![0],
+            reading: HashSet::new(),
+            batch_out: false,
+            wanted: BTreeSet::new(),
+            eager: 0,
+            cursor: 0,
+            expanding: HashSet::new(),
+            colours: Default::default(),
+            viewed: HashMap::new(),
+            folds: HashMap::new(),
+            tree: Default::default(),
+            closed: HashSet::new(),
+            hide_viewed: false,
+            shown: Vec::new(),
+            picked: None,
+            filter,
+            filter_text: String::new(),
+            files_scroll: UniformListScrollHandle::new(),
+            files_focus: cx.focus_handle(),
+            revealed: Cell::new(None),
+            search: search::Search::new(search),
             draft: None,
+            selection: None,
+            selecting: false,
             notes: Vec::new(),
             marks: HashMap::new(),
             input,
-            scroll: UniformListScrollHandle::new(),
+            scroll: ListState::new(0, ListAlignment::Top, px(super::OVERDRAW)),
+            hinted: Default::default(),
             grab: 0.,
             request: 0,
-            focus,
+            focus: cx.focus_handle(),
             files_shown: None,
             notes_shown: None,
             width: Default::default(),
+            seen: None,
+            restore: None,
+            _subscriptions: subscriptions,
         }
     }
 }

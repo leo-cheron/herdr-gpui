@@ -3,7 +3,11 @@
 //! compact host's name, and the details in a tooltip.
 
 use super::{HISTORY, Reading, sample::Memory};
-use crate::{config::Theme, usage::Host, window::HerdrWindow};
+use crate::{
+    config::{Theme, status_bar::Detail},
+    usage::Host,
+    window::HerdrWindow,
+};
 use gpui::{prelude::*, *};
 
 const BAR_WIDTH: f32 = 2.;
@@ -48,7 +52,12 @@ impl HerdrWindow {
                 ),
             );
         }
-        Some(segment.child(line(reading, theme, None)))
+        Some(segment.child(line(
+            reading,
+            theme,
+            None,
+            self.config.status_bar.system_load,
+        )))
     }
 }
 
@@ -70,9 +79,11 @@ pub(crate) fn tooltip(
     }
 }
 
-/// `CPU ▁▃▂▅ 12%  MEM ━━─ 61%`. `glyph` fixes each share's width so a
-/// row's columns do not shift as numbers change; None lets them size.
-pub(crate) fn line(reading: &Reading, theme: &Theme, glyph: Option<f32>) -> Div {
+/// `CPU ▁▃▂▅ 12%  MEM ━━─ 61%`, or `CPU 12%  MEM 61%` when compact. `glyph`
+/// fixes each share's width so a row's columns do not shift as numbers
+/// change; None lets them size.
+pub(crate) fn line(reading: &Reading, theme: &Theme, glyph: Option<f32>, detail: Detail) -> Div {
+    let graphs = detail == Detail::Detailed;
     let Some(sample) = reading.latest() else {
         return div().text_color(rgb(theme.muted)).child("CPU and memory…");
     };
@@ -86,7 +97,7 @@ pub(crate) fn line(reading: &Reading, theme: &Theme, glyph: Option<f32>) -> Div 
         .items_center()
         .gap(px(ITEM_GAP))
         .child(label("CPU"))
-        .child(sparkline(reading.history(), theme));
+        .when(graphs, |cpu| cpu.child(sparkline(reading.history(), theme)));
     if let Some(value) = sample.cpu {
         cpu = cpu.child(share(value, CPU_WARN, stale, theme, glyph));
     }
@@ -98,7 +109,7 @@ pub(crate) fn line(reading: &Reading, theme: &Theme, glyph: Option<f32>) -> Div 
             .items_center()
             .gap(px(ITEM_GAP))
             .child(label("MEM"))
-            .child(meter(memory, theme))
+            .when(graphs, |row| row.child(meter(memory, theme)))
             .child(share(memory.percent(), MEMORY_WARN, stale, theme, glyph))
     });
     div()

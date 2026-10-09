@@ -40,6 +40,8 @@ pub enum ClientEvent {
     VersionMismatch(VersionMismatch),
     Disconnected {
         reason: String,
+        /// Why `ssh` refused the bridge, when the connection never got past it.
+        ssh: Option<crate::SshFailure>,
     },
 }
 

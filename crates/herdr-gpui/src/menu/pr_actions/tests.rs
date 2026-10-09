@@ -6,7 +6,7 @@ use gpui::{Entity, TestAppContext, VisualTestContext, point, px, size};
 fn input() -> crate::pull_request::Input {
     crate::pull_request::Input {
         checkout: None,
-        repo_key: REPO_KEY.into(),
+        repo_key: Some(REPO_KEY.into()),
         branch: "develop".into(),
     }
 }
@@ -57,7 +57,6 @@ fn an_open_pull_request_offers_review_comment_and_merge(cx: &mut TestAppContext)
         assert_eq!(
             labels(view.read(cx)),
             [
-                "Review changes...",
                 "Commit...",
                 "Push",
                 "Open pull request #8",
@@ -94,8 +93,8 @@ fn an_open_pull_request_offers_review_comment_and_merge(cx: &mut TestAppContext)
                 .pr_cache
                 .seed(input(), pr, std::time::Instant::now());
             view.update_pr_actions(std::time::Instant::now());
-            // Review changes, commit, push, and opening the pull request.
-            assert_eq!(labels(view).len(), 4);
+            // Commit, push, and opening the pull request.
+            assert_eq!(labels(view).len(), 3);
         })
     });
 }

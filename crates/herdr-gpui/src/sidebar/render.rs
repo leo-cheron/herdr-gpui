@@ -3,19 +3,19 @@
 //! caches only.
 
 use super::{
-    DEVICE_FOOTER_HEIGHT, HOST_ARROW_WIDTH, HOST_GAP, STATUS_WIDTH, SidebarDrag, agent_name,
-    agents::{Indicators, agent_place, state_label, status_text},
+    DEVICE_FOOTER_HEIGHT, STATUS_WIDTH, SidebarDrag,
+    agents::Indicators,
     agents_sort,
-    cell::{AgentRow, Cell, Fold, RowContext, RowData, RowState, WorkspaceRow, layout_for},
+    cell::{Cell, Fold, RowContext, RowData, WorkspaceRow, layout_for},
     label_text,
     layout::{self, SidebarLook},
     line_height,
     reorder::{self, Plan},
-    row::{RowIcon, RowLift, RowTree, removing_dot},
-    sidebar_width, sorted_agents,
+    row::{RowIcon, RowLift, RowTree},
+    sidebar_width, sticky,
     tokens::{self, SpaceContext},
-    visible_workspace_entries,
-    workspaces::{displayed_workspace_status, workspace_badge, workspace_label},
+    visible_workspace_entries, wash,
+    workspaces::{displayed_workspace_status, workspace_badge, workspace_label, workspace_note},
 };
 use crate::{
     Command, HerdrWindow, NavigationTarget,
@@ -23,6 +23,8 @@ use crate::{
     fonts::StyledFont,
 };
 use gpui::{prelude::*, *};
+
+mod agent_rows;
 
 impl HerdrWindow {
     pub(crate) fn render_sidebar(
@@ -33,20 +35,15 @@ impl HerdrWindow {
     ) -> Stateful<Div> {
         let width = sidebar_width(self.sidebar_width, f32::from(window.viewport_size().width));
         let split = self.sidebar_split.unwrap_or(0.5).clamp(0.1, 0.9);
-        let look = layout::for_mode(self.config.layout.mode);
+        let look = layout::for_config(&self.config);
         let rows = layout_for(self.config.layout.mode);
         // The row a workspace menu was opened for keeps looking hovered while
         // the pointer is over the menu.
         let menu_target = self.workspace_menu_target();
         let layout = look.density;
         let content_x = look.content_x();
-        // The label yields room to the arrow and to the trailing status dot.
-        let host_label_width =
-            (look.content_width(width) - HOST_ARROW_WIDTH - 2. * HOST_GAP - STATUS_WIDTH).max(0.);
         let view = cx.entity().downgrade();
         let font = &self.config.sidebar;
-        let agents_custom = self.config.usage.inline
-            && self.config.sidebar_layout.agents != crate::config::AgentLayout::default();
         let spaces_custom = self.config.usage.inline
             && self.config.sidebar_layout.spaces != crate::config::SpaceLayout::default();
         let theme = &self.theme;
@@ -76,6 +73,9 @@ impl HerdrWindow {
         // Agent rows are counted by `agent_count`, which indexes that list.
         let mut space_rows = 0usize;
         let mut highlighted = [None; 2];
+        // Each host header's endpoint index and child position in the spaces
+        // list, for the header pinned over it.
+        let mut host_rows = Vec::new();
         // A lifted workspace row: each drop unit's rows in the spaces list, and
         // the move every gap makes, for the pointer handler below.
         let mut drop_rows = Vec::new();
@@ -89,170 +89,15 @@ impl HerdrWindow {
             }
             let selected = endpoint_index == self.selected_endpoint;
             let endpoint_id = endpoint.id.clone();
+            let mark = wash::HostMark::resolve(
+                &self.config.sidebar_style,
+                &endpoint.label,
+                selected,
+                theme,
+            );
             if multi {
-                let collapse_id = endpoint_id.clone();
-                let select_id = endpoint_id.clone();
-                let menu_id = endpoint_id.clone();
-                let removing = self.menu.removing_devices.contains(&endpoint.id);
-                let host = crate::usage::Host::from(&endpoint.connection.target);
-                let load = self
-                    .config
-                    .show_system_load
-                    .then(|| self.system_load.get(&host))
-                    .flatten();
-                // Densities with detail lines give the load its own line;
-                // compact ones fit gauges between the name and the status.
-                let load_line = load.filter(|_| layout.workspace_details());
-                let gauges = load.filter(|_| load_line.is_none()).map(|reading| {
-                    crate::system_load::gauges(
-                        reading,
-                        theme,
-                        super::metrics::glyph_width(font),
-                        (font.size * 0.8).round(),
-                    )
-                });
-                // The removal pulse and the gauges take their room from the
-                // label, not from the status.
-                let label_width = (host_label_width
-                    - if removing {
-                        STATUS_WIDTH + HOST_GAP
-                    } else {
-                        0.
-                    }
-                    - gauges.as_ref().map_or(0., |(width, _)| width + HOST_GAP))
-                .max(0.);
-                let lines = 1. + if load_line.is_some() { 1. } else { 0. };
-                spaces = spaces.child(
-                    div()
-                        .id(SharedString::from(format!("host-{endpoint_id}")))
-                        .debug_selector(|| format!("host-{endpoint_id}"))
-                        .h(px(lines * line_height(font)
-                            + 2. * layout.host_padding()
-                            + look.chrome_height()))
-                        .flex_none()
-                        .relative()
-                        .flex()
-                        .flex_col()
-                        .justify_center()
-                        .px(px(content_x))
-                        // Hosts mark selection only; they do not join the rows'
-                        // hover group.
-                        .child(look.highlight(
-                            &format!("host-{endpoint_id}"),
-                            RowState {
-                                selected,
-                                ..RowState::default()
-                            },
-                            theme,
-                        ))
-                        .text_color(rgb(if endpoint.enabled {
-                            theme.foreground
-                        } else {
-                            theme.muted
-                        }))
-                        .cursor_pointer()
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                cx.stop_propagation();
-                                this.open_host_menu(&menu_id, event.position, window, cx);
-                                this.menu.opening_right_click =
-                                    this.menu.page == Some(crate::menu::Page::Host);
-                            }),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(HOST_GAP))
-                                .child(
-                                    div()
-                                        .id(SharedString::from(format!(
-                                            "collapse-host-{endpoint_id}"
-                                        )))
-                                        .w(px(HOST_ARROW_WIDTH))
-                                        .flex_none()
-                                        .child(label_text(if endpoint.collapsed {
-                                            "\u{25b8}"
-                                        } else {
-                                            "\u{25be}"
-                                        }))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            if let Some(endpoint) = this
-                                                .endpoints
-                                                .iter_mut()
-                                                .find(|e| e.id == collapse_id)
-                                            {
-                                                endpoint.collapsed = !endpoint.collapsed;
-                                            }
-                                            cx.notify();
-                                        })),
-                                )
-                                .when(removing, |row| {
-                                    row.child(removing_dot("host-removing", theme))
-                                })
-                                .child(
-                                    div()
-                                        // As with workspace labels, avoid zero-basis text measurement.
-                                        .w(px(label_width))
-                                        .flex_none()
-                                        .overflow_hidden()
-                                        .child(
-                                            div()
-                                                .w(px(label_width))
-                                                .truncate()
-                                                .child(label_text(&endpoint.label)),
-                                        ),
-                                )
-                                .when_some(gauges.zip(load), |row, ((_, gauges), reading)| {
-                                    row.child(
-                                        div()
-                                            .id(SharedString::from(format!(
-                                                "host-load-{endpoint_id}"
-                                            )))
-                                            .flex_none()
-                                            .child(gauges)
-                                            .tooltip(crate::system_load::tooltip(
-                                                reading, &host, theme,
-                                            )),
-                                    )
-                                })
-                                .child(
-                                    div()
-                                        .debug_selector(|| format!("host-status-{endpoint_id}"))
-                                        .size(px(STATUS_WIDTH))
-                                        .flex_none()
-                                        .rounded_full()
-                                        .bg(rgb(if endpoint.live.status.is_connected() {
-                                            crate::menu::online(theme)
-                                        } else {
-                                            theme.muted
-                                        })),
-                                ),
-                        )
-                        .when_some(load_line, |row, reading| {
-                            row.child(
-                                div()
-                                    .id(SharedString::from(format!("host-load-{endpoint_id}")))
-                                    .h(px(line_height(font)))
-                                    .flex()
-                                    .items_center()
-                                    .pl(px(HOST_ARROW_WIDTH + HOST_GAP))
-                                    .overflow_hidden()
-                                    .child(crate::system_load::line(
-                                        reading,
-                                        theme,
-                                        Some(super::metrics::glyph_width(font)),
-                                    ))
-                                    .tooltip(crate::system_load::tooltip(reading, &host, theme)),
-                            )
-                        })
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.select_endpoint(&select_id, cx);
-                            window.focus(&this.focus, cx);
-                        })),
-                );
+                host_rows.push((endpoint_index, space_rows));
+                spaces = spaces.child(self.host_row(endpoint, selected, look, width, false, cx));
                 space_rows += 1;
             }
             let row_cx = RowContext {
@@ -261,10 +106,12 @@ impl HerdrWindow {
                 theme,
                 look,
                 width,
+                nest: if multi { look.nest_indent() } else { 0. },
+                mark,
                 host: (multi && endpoint_id != crate::endpoint::LOCAL)
                     .then_some(endpoint.label.as_str()),
             };
-            let daemon = crate::listening_ports::Daemon::from(&endpoint.connection.target);
+            let daemon = crate::listening_ports::Daemon::of(&endpoint.connection.target);
             let live = if selected { &self.live } else { &endpoint.live };
             let Some(snapshot) = &live.snapshot else {
                 continue;
@@ -419,26 +266,58 @@ impl HerdrWindow {
                             &workspace.workspace_id,
                         )
                     });
+                // Lines under the row start under its label column, clear of
+                // the status dot.
+                let under_left = content_x
+                    + row_cx.nest
+                    + if indented {
+                        layout.child_indent() + indicators.width(font) - STATUS_WIDTH
+                    } else {
+                        0.
+                    }
+                    + indicators.width(font)
+                    + layout.gap();
+                let note = workspace_note(
+                    workspace,
+                    crate::worktree_notes::Notes::of(cx),
+                    &endpoint.id,
+                )
+                .map(SharedString::from);
+                let note_line = note.clone().map(|note| {
+                    let endpoint = endpoint_id.clone();
+                    let workspace = id.clone();
+                    super::note_line::element(
+                        &format!("{endpoint_id}-{id}"),
+                        note,
+                        (under_left, content_x),
+                        font,
+                        theme,
+                    )
+                    .on_click(cx.listener(
+                        move |this, event: &ClickEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.edit_worktree_note(
+                                &endpoint,
+                                &workspace,
+                                event.position(),
+                                window,
+                                cx,
+                            );
+                        },
+                    ))
+                });
                 let ports = (self.config.show_listening_ports && !removing_row)
-                    .then(|| self.listening_ports.get(&daemon, &workspace.workspace_id))
+                    .then_some(daemon.as_ref())
                     .flatten()
+                    .and_then(|daemon| self.listening_ports.get(daemon, &workspace.workspace_id))
                     .map(|listed| {
-                        // Under the label column, clear of the status dot.
-                        let indent = if indented {
-                            layout.child_indent() + indicators.width(font) - STATUS_WIDTH
-                        } else {
-                            0.
-                        };
                         div()
                             .debug_selector(|| format!("ports-{endpoint_id}-{id}"))
                             .h(px(line_height(font)))
                             .flex_none()
                             .w_full()
                             .min_w_0()
-                            .pl(px(content_x
-                                + indent
-                                + indicators.width(font)
-                                + layout.gap()))
+                            .pl(px(under_left))
                             .pr(px(content_x))
                             .text_size(px((font.size * 0.85).round()))
                             .child(crate::listening_ports::chips(
@@ -472,6 +351,7 @@ impl HerdrWindow {
                                 .then_some(&self.menu.pr_cache),
                             &self.git,
                             (&self.teleport_marks, &endpoint.id),
+                            note.as_deref(),
                             theme,
                         ),
                         removing: removing_row,
@@ -586,14 +466,15 @@ impl HerdrWindow {
                     )
                 })
                 .when(carried, |row| row.cursor_grabbing());
-                // Ports ride under their row as one list item, so the drop
-                // preview still measures one height per workspace.
-                let element = match ports {
-                    None => element
+                // The note and ports ride under their row as one list item, so
+                // the drop preview still measures one height per workspace.
+                let element = if note_line.is_none() && ports.is_none() {
+                    element
                         .when(gap > 0., |row| row.mt(px(gap)))
                         .when(shift != px(0.), |row| row.top(shift))
-                        .into_any_element(),
-                    Some(ports) => div()
+                        .into_any_element()
+                } else {
+                    div()
                         .flex()
                         .flex_col()
                         .flex_none()
@@ -602,8 +483,9 @@ impl HerdrWindow {
                         .when(gap > 0., |unit| unit.mt(px(gap)))
                         .when(shift != px(0.), |unit| unit.top(shift))
                         .child(element)
-                        .child(ports)
-                        .into_any_element(),
+                        .children(note_line)
+                        .children(ports)
+                        .into_any_element()
                 };
                 spaces = if carried {
                     // Painted last so it floats over the rows it passes, while
@@ -613,71 +495,33 @@ impl HerdrWindow {
                     spaces.child(element)
                 };
             }
-            if !self.config.show_agents {
-                continue;
+            // Agent rows come after every host: the panel interleaves them.
+            // Only a host the panel lists can make the view a filtered one.
+            if self.config.show_agents && endpoint.enabled {
+                filtered |= snapshot.agent_view_label.is_some();
             }
-            filtered |= snapshot.agent_view_label.is_some();
-            for agent in sorted_agents(snapshot, self.agent_sort) {
-                let lines = if agents_custom {
-                    let Some(lines) = tokens::agent_rows(
-                        &self.config.sidebar_layout.agents,
-                        agent,
-                        snapshot,
-                        row_cx.host,
-                    ) else {
-                        continue;
-                    };
-                    lines
-                } else {
-                    Vec::new()
-                };
-                if selected && agent.focused {
-                    highlighted[1] = Some(agent_count);
-                }
-                let gap = if agents_custom && agent_count > 0 {
-                    f32::from(self.config.sidebar_layout.agents.row_gap) * line_height(font)
-                } else {
-                    0.
-                };
-                agent_count += 1;
-                let id = agent.pane_id.clone();
-                let navigate_endpoint = endpoint_id.clone();
-                agents = agents.child(
-                    Cell::new(
-                        rows,
-                        RowData::Agent(AgentRow {
-                            key: format!("agent-{id}"),
-                            name: agent_name(agent),
-                            icon: crate::icons::AgentIcon::from_identity(agent.agent.as_deref()),
-                            status: agent.agent_status,
-                            place: agent_place(agent, snapshot),
-                            status_text: self
-                                .config
-                                .sidebar_layout
-                                .agents
-                                .shows_status_text(agent.agent.as_deref())
-                                .then(|| state_label(agent, status_text(agent.agent_status))),
-                            lines,
-                        }),
-                        &row_cx,
-                    )
-                    .selected(selected && agent.focused)
-                    .row()
-                    .when(gap > 0., |row| row.mt(px(gap)))
-                    .id(SharedString::from(format!("agent-{endpoint_id}-{id}")))
-                    .when(multi, |row| {
-                        row.debug_selector(|| format!("agent-{endpoint_id}-{id}"))
-                    })
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.navigate_endpoint(&navigate_endpoint, NavigationTarget::Pane(&id), cx);
-                        window.focus(&this.focus, cx);
-                    })),
-                );
-            }
+        }
+        if self.config.show_agents {
+            (agents, agent_count, highlighted[1]) =
+                self.append_agent_rows(agents, indicators, look, width, cx);
         }
         if sliding {
             window.request_animation_frame();
         }
+        let mut headers = if multi {
+            self.host_headers(&host_rows)
+        } else {
+            Vec::new()
+        };
+        if let Some(row) = self.sidebar_pin_reveal.take()
+            && self.uncover_revealed(row, &headers)
+        {
+            headers = self.host_headers(&host_rows);
+        }
+        // Rows under the pinned header are hidden, so a reveal must clear it.
+        let cover = px(sticky::cover(&headers));
+        let pinned_host = sticky::pinned(&headers)
+            .and_then(|pinned| self.pinned_host_row(pinned, look, width, cx));
         // Follow the selection, but only once a frame has measured the viewport:
         // the handle resolves the request against the previous frame's bounds, so
         // an unmeasured list would scroll to a meaningless offset. Recording what
@@ -688,15 +532,24 @@ impl HerdrWindow {
                 && self.sidebar_scroll[list].bounds().size.height > px(0.)
             {
                 let scroll = &self.sidebar_scroll[list];
+                let cover = if list == 0 { cover } else { px(0.) };
                 let visible = scroll.bounds_for_item(row).is_some_and(|bounds| {
                     let offset = scroll.offset().y;
-                    bounds.bottom() + offset > scroll.bounds().top()
+                    bounds.bottom() + offset > scroll.bounds().top() + cover
                         && bounds.top() + offset < scroll.bounds().bottom()
                 });
                 // Even a partially visible worktree is already seen. GPUI's
                 // reveal also moves clipped rows, so only request it off-screen.
                 if !visible {
                     scroll.scroll_to_item(row);
+                    // The scroll lands in prepaint, after this render pinned a
+                    // header for the old offset, and puts a row from above at
+                    // the top edge, under the pinned header. Another frame pins
+                    // for the new offset and moves the row out from under it.
+                    if list == 0 && multi {
+                        window.request_animation_frame();
+                        self.sidebar_pin_reveal.set(Some(row));
+                    }
                 }
                 self.sidebar_revealed[list].set(Some(row));
             }
@@ -747,7 +600,19 @@ impl HerdrWindow {
                     .min_h_0()
                     .overflow_hidden()
                     .child(header("spaces", font, theme, look))
-                    .child(spaces)
+                    // The wrapper clips the pinned header as the next host's
+                    // pushes it up, so it never paints over the title above.
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .flex_col()
+                            .overflow_hidden()
+                            .child(spaces)
+                            .children(pinned_host),
+                    )
                     .child(
                         div()
                             .flex_none()

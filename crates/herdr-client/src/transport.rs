@@ -64,7 +64,14 @@ mod windows {
     /// both ends agree without either of them owning a file at that path.
     fn connect(path: &Path) -> io::Result<LocalStream> {
         let name = path.to_string_lossy().into_owned();
-        LocalStream::connect(name.to_ns_name::<GenericNamespaced>()?)
+        let name = name.to_ns_name::<GenericNamespaced>().inspect_err(|error| {
+            tracing::warn!(operation = "pipe_name", kind = ?error.kind(), raw_os_error = ?error.raw_os_error(), "Windows local transport failed");
+        })?;
+        LocalStream::connect(name).inspect_err(|error| {
+            // Keep native codes without recording the user's socket path. The
+            // byte-mode connector opens the pipe without changing its read mode.
+            tracing::warn!(operation = "pipe_connect", kind = ?error.kind(), raw_os_error = ?error.raw_os_error(), "Windows local transport failed");
+        })
     }
 
     /// Whether an error means the pipe is gone rather than merely idle. Mirrors
@@ -115,7 +122,12 @@ mod windows {
             return Ok(Some(ready));
         }
         let error = io::Error::last_os_error();
-        if closed(&error) { Ok(None) } else { Err(error) }
+        if closed(&error) {
+            Ok(None)
+        } else {
+            tracing::warn!(operation = "pipe_peek", kind = ?error.kind(), raw_os_error = ?error.raw_os_error(), "Windows local transport failed");
+            Err(error)
+        }
     }
 
     /// Sleeps until the next peek, or reports the elapsed deadline the way a
@@ -230,3 +242,7 @@ mod windows {
         }
     }
 }
+
+#[cfg(all(test, windows))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests;

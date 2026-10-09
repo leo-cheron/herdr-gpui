@@ -64,8 +64,12 @@ pub enum Error {
     SoundTimeout,
     #[error("Audio playback cancelled")]
     SoundCancelled,
-    #[error("Could not keep the display awake")]
-    Caffeine(#[source] io::Error),
+    #[error("Could not keep the display awake: {0}")]
+    Caffeine(#[source] keepawake::Error),
+    #[error("Could not start the keep-awake thread")]
+    CaffeineThread(#[source] io::Error),
+    #[error("The keep-awake thread stopped; the display may sleep")]
+    CaffeineWorkerStopped,
     #[error(
         "PR lookup requires your owned local session socket or a saved SSH device. Other socket locations are unsupported."
     )]
@@ -146,6 +150,10 @@ pub enum Error {
     StaleWorkspace,
     #[error("Workspace label must not be empty.")]
     EmptyWorkspaceLabel,
+    #[error("{0} cannot be reached by script. Choose another host.")]
+    DispatchHostUnavailable(String),
+    #[error("Another host is still being set up. Wait for it to finish.")]
+    DispatchBusy,
     #[error(
         "Invalid Git branch name. Use a name such as config-reload, without spaces or special ref characters."
     )]
@@ -192,6 +200,8 @@ pub enum Error {
     PrEncoding(#[source] std::str::Utf8Error),
     #[error("No repository metadata.")]
     PrMetadata,
+    #[error("Workspace directory is not in a Git repository.")]
+    PrWorkspaceRepository,
     #[error("Could not {operation} the agent context note for the new checkout.")]
     AgentContext {
         operation: &'static str,
@@ -273,13 +283,13 @@ pub enum Error {
     #[error("Missing credential directory.")]
     CredentialDirectory,
     #[error(
-        "Cannot access private GitHub credential file. Require an owned directory and regular 0600 file; symlinks are rejected."
+        "Cannot access private credential file. Require an owned directory and regular 0600 file; symlinks are rejected."
     )]
     CredentialPermissions,
-    #[error("Cannot access private GitHub credential file.")]
+    #[error("Cannot access private credential file.")]
     CredentialIo(#[source] io::Error),
     #[error(
-        "No secure credential store configured. Explicitly opt in with [github] allow_plaintext_credentials = true, or use GH_TOKEN / GITHUB_TOKEN."
+        "No secure credential store configured. Explicitly opt in with allow_plaintext_credentials = true in the [github] or [coder] table, or use GH_TOKEN / GITHUB_TOKEN for GitHub."
     )]
     CredentialPolicy,
     #[error(
@@ -290,7 +300,7 @@ pub enum Error {
     PrCancelled,
     #[error("PR lookup timed out (15 seconds).")]
     PrTimeout,
-    #[error("GitHub network request failed or timed out.")]
+    #[error("GitHub network request failed or timed out ({0}).")]
     GitHubNetwork(#[source] ureq::Error),
     #[error("GitHub query failed. Check token repository permissions and rate limits.")]
     GitHubQuery,
@@ -330,6 +340,15 @@ pub enum Error {
     GitHubTokenType,
     #[error("GitHub {0} worker stopped.")]
     GitHubWorker(&'static str),
+    #[cfg(feature = "coder")]
+    #[error(transparent)]
+    Coder(#[from] crate::coder::Error),
+    #[cfg(feature = "daytona")]
+    #[error(transparent)]
+    Daytona(#[from] crate::daytona::Error),
+    #[cfg(feature = "cloud")]
+    #[error(transparent)]
+    Cloud(#[from] crate::cloud::Error),
     #[error("{0}")]
     Config(#[source] config_loader::ConfigError),
     #[error("{source}")]
@@ -387,12 +406,29 @@ pub enum Error {
     UsageJson(serde_json::error::Category),
     #[error("Could not reach this host over SSH to read usage.")]
     UsageUnreachable,
+    /// Only the host and port are named: the address's query may hold the
+    /// server's connection token.
+    #[error("{reason} at {address}.")]
+    CodeUnreachable {
+        address: String,
+        reason: crate::code_server::NoAnswer,
+        #[source]
+        source: ureq::Error,
+    },
+    #[error("This address is not a VS Code server (HTTP {status}).")]
+    CodeNotServer { status: u16 },
+    #[error("The server refused the connection token. Use the address it prints, with its ?tkn=.")]
+    CodeTokenRefused,
+    #[error("The VS Code server answered HTTP {0}.")]
+    CodeStatus(u16),
     #[error("curl is not installed on this host, so usage cannot be read.")]
     UsageMissingCurl,
     #[error("Remote usage needs SSH, which this platform's client does not support.")]
     UsageUnsupported,
     #[error("usage must be a TOML table")]
     InvalidUsageTable,
+    #[error("code must be a TOML table")]
+    InvalidCodeTable,
     #[error("Could not read CPU and memory on this host.")]
     SystemLoadRemote(#[source] Box<Error>),
     /// The host's `uname -s`, bounded, so the message names what it is.
@@ -494,6 +530,38 @@ pub enum Error {
     WorktreeScriptsResponse,
     #[error("This workspace is not a Git checkout Herdr knows yet")]
     WorktreeScriptsNotGit,
+    #[error(
+        "editor_command must be at most 1024 bytes without quotes, backslashes, or control characters"
+    )]
+    EditorCommand,
+    #[error("A code tab must name an absolute file path without control characters")]
+    InvalidCodeFile,
+    #[error("This file is missing, larger than 1 MiB, or not UTF-8 text")]
+    CodeFileUnreadable,
+    #[error("Only a local Git checkout can be searched for files and symbols")]
+    CodeIndexRoot,
+    #[error("Reading the checkout was cancelled")]
+    CodeIndexCancelled,
+    #[error("This path cannot be typed into a shell safely, so it opens in the default app")]
+    EditorPath,
+    #[error("Opening a terminal editor needs a Unix shell in the pane")]
+    EditorUnsupported,
+    #[error("The Neovim in the editor pane did not answer")]
+    EditorRemote,
+    #[error("Could not run nvim to reach the editor pane")]
+    EditorRemoteLaunch(#[source] io::Error),
+    #[error("The Neovim in the editor pane is busy: answer it, then try again")]
+    EditorRemoteBusy,
+    #[error("The Neovim in the editor pane could not open the file")]
+    EditorRemoteFailed,
+    #[error("Another file is still opening in the editor")]
+    EditorBusy,
+    #[error("No local pane to open the editor beside")]
+    EditorNoPane,
+    #[error("Unexpected daemon response while opening the editor pane")]
+    EditorResponse,
+    #[error(transparent)]
+    EditorRequest(std::sync::Arc<Error>),
     #[error("neither XDG_STATE_HOME nor HOME is set")]
     MissingStateRoot,
     #[error("{} exceeds {limit} bytes", path.display())]
@@ -508,6 +576,12 @@ pub enum Error {
     InvalidAnnotation,
     #[error("Invalid saved browser tabs")]
     InvalidBrowserTabs,
+    #[error("Worktree notes stay in this app and are never sent to the daemon")]
+    LocalWorktreeNote,
+    #[error("Invalid saved worktree notes")]
+    InvalidWorktreeNotes,
+    #[error("Invalid saved dispatch history")]
+    InvalidDispatchHistory,
     #[error("Invalid saved editor groups")]
     InvalidGroupLayouts,
     #[error("Herdr GPUI is not running, or its control socket {} is unreachable: {source}", path.display())]
@@ -537,6 +611,9 @@ pub enum Error {
     #[cfg(any(target_os = "macos", windows))]
     #[error("Could not reach the native window for the page: {0}")]
     WindowHandle(#[from] WindowHandleError),
+    #[cfg(target_os = "macos")]
+    #[error("The page that opened a popup is no longer in a window")]
+    PopupOpener,
     #[error("Could not install the agent skill at {}: {source}", path.display())]
     SkillInstall {
         path: PathBuf,
@@ -556,6 +633,25 @@ pub enum Error {
     DeviceExists(String),
     #[error("This host is already being added.")]
     DeviceAdding,
+    #[error("Searching the local network failed: {0}")]
+    Bonjour(#[from] mdns_sd::Error),
+    #[error("Could not list this machine's network addresses: {0}")]
+    LocalAddresses(#[source] io::Error),
+    #[error("Tailscale is unavailable ({status}){}", if detail.is_empty() { String::new() } else { format!(": {detail}") })]
+    TailscaleStatus {
+        status: std::process::ExitStatus,
+        detail: String,
+    },
+    #[error("Tailscale did not answer in time")]
+    TailscaleTimeout,
+    #[error("Tailscale returned an unreadable status: {0}")]
+    TailscaleJson(#[source] serde_json::Error),
+    #[error("Could not read {}: {source}", path.display())]
+    SshConfig {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("Removing the device failed ({status}){}", if detail.is_empty() { String::new() } else { format!(": {detail}") })]
     DeviceRemove {
         status: std::process::ExitStatus,
@@ -607,6 +703,10 @@ pub enum Error {
     TooManyFontFallbacks(&'static str),
     #[error("layout.sidebar_gap must be finite and between 0 and 64 logical pixels")]
     InvalidSidebarGap,
+    #[error("sidebar.{key} must be finite and between 0 and {max} logical pixels")]
+    InvalidSidebarMetric { key: &'static str, max: f32 },
+    #[error("sidebar.hosts.{host:?} must be a #rgb or #rrggbb colour, not {value:?}")]
+    InvalidHostColor { host: String, value: String },
     #[error("theme must be a name, absolute path, or ~/ path")]
     InvalidThemePath,
     #[error("a theme that follows the system must name both sides: light:NAME,dark:NAME")]
@@ -792,6 +892,19 @@ pub enum ThemeParseError {
 mod tests {
     use super::*;
     use std::error::Error as _;
+
+    #[test]
+    fn github_network_message_names_the_transport_failure() {
+        let error = Error::GitHubNetwork(ureq::Error::Io(io::Error::other(
+            "invalid peer certificate: UnknownIssuer",
+        )));
+        let message = error.to_string();
+        assert!(message.starts_with("GitHub network request failed or timed out"));
+        assert!(
+            message.contains("invalid peer certificate: UnknownIssuer"),
+            "{message}"
+        );
+    }
 
     #[test]
     fn updater_wrapper_preserves_source_chain() {

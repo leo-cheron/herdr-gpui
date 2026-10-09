@@ -179,23 +179,28 @@ impl HerdrWindow {
             self.wheel = WheelAccumulator::default();
             return;
         };
+        let mut steps = self
+            .wheel
+            .steps(&target, event, self.cell_width, cell_height);
         // Scrollback follows the OS's motion exactly; anything else, such as an
-        // application reading the wheel, gets whole lines as they accumulate.
+        // application reading the wheel, gets whole steps as they accumulate.
         let smooth = match &target.target {
             InputTarget::Pane(id) if self.slides_allowed() => {
                 self.presentation.wheel(id, wheel_rows(event, cell_height))
             }
             InputTarget::Pane(_) | InputTarget::Popup(_) => None,
         };
-        let lines = smooth.unwrap_or_else(|| self.wheel.lines(&target.target, event, cell_height));
+        if let Some(lines) = smooth {
+            steps.lines = lines;
+        }
         cx.stop_propagation();
-        if lines != 0 {
-            let input = target.event(lines, event.modifiers);
+        for input in target.wheel_events(steps, event.modifiers) {
             let result =
                 ConnectionBridge::send_input(handle, &snapshot.boot_id, &target.target, input);
             if let Err(error) = result {
                 self.local_error = Some(format!("Wheel input not sent: {error}"));
                 cx.notify();
+                break;
             }
         }
         if smooth.is_some() {
@@ -246,24 +251,28 @@ impl HerdrWindow {
         {
             self.input_probe.keys += 1;
         }
+        let modifiers = event.keystroke.modifiers;
+        let option_keys = if modifiers.alt {
+            crate::input::held_option_keys()
+        } else {
+            crate::config::OptionKeys::LEFT
+        };
         let alt_keys = self
             .config
             .option_as_alt
-            .sends_alt(cx.keyboard_layout().id());
-        let modifiers = event.keystroke.modifiers;
+            .sends_alt(cx.keyboard_layout().id(), option_keys);
         // Cmd-C copies a selection that is still highlighted. Ctrl-C does too
         // only while Herdr's `copy_on_select` is off, as in Herdr, where the
         // highlight is waiting for that copy; a selection the release already
         // copied must not stop Ctrl-C from interrupting the pane.
         let copy = if modifiers.platform {
-            !modifiers.control
+            !modifiers.control && !modifiers.shift
         } else {
-            modifiers.control && !self.copy_on_select()
+            modifiers.control && (modifiers.shift || !self.copy_on_select())
         };
         if event.keystroke.key.eq_ignore_ascii_case("c")
             && copy
             && !modifiers.alt
-            && !modifiers.shift
             && self.copy_retained_selection(cx)
         {
             cx.stop_propagation();
@@ -276,7 +285,11 @@ impl HerdrWindow {
         {
             cx.stop_propagation();
             window.prevent_default();
-        } else if event.keystroke.modifiers.platform && event.keystroke.key == "v" {
+        } else if (event.keystroke.modifiers.platform
+            || (event.keystroke.modifiers.control && event.keystroke.modifiers.shift)
+            || (event.keystroke.modifiers.shift && event.keystroke.key == "insert"))
+            && (event.keystroke.key.eq_ignore_ascii_case("v") || event.keystroke.key == "insert")
+        {
             self.paste(cx);
             cx.stop_propagation();
             window.prevent_default();

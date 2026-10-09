@@ -28,6 +28,10 @@ mod selection;
 #[path = "smoke_clipboard.rs"]
 mod clipboard;
 
+#[cfg(target_os = "linux")]
+#[path = "smoke_input.rs"]
+mod input_shutdown;
+
 #[path = "smoke_sidebar.rs"]
 mod sidebar_fixture;
 pub use sidebar_fixture::start_sidebar;
@@ -67,6 +71,8 @@ pub struct InputProbe {
     pub actions: u64,
     pub keys: u64,
     pub text: u64,
+    /// Compositions the platform's input method was told to drop.
+    pub compositions_discarded: u64,
 }
 
 const STEPS: &[&str] = &[
@@ -150,7 +156,7 @@ fn create_external_workspace(
                     _client: client,
                 });
             }
-            ClientEvent::Disconnected { reason } => {
+            ClientEvent::Disconnected { reason, .. } => {
                 bail!(reason);
             }
             ClientEvent::CommandRejected { reason, .. } => {
@@ -354,7 +360,7 @@ pub fn start(handle: WindowHandle<HerdrWindow>, cx: &mut App) {
                     10 if options.surface_size != old_size && last_queued_options == Some(options)
                         && surface.frame.width == options.surface_size.cols && surface.frame.height == options.surface_size.rows => {
                         eprintln!("GUI native resize verified: {:?} -> {:?}", old_size, options.surface_size);
-                        view.update(cx, |view, cx| { view.reconnect(); window.focus(&view.focus, cx); cx.notify(); });
+                        view.update(cx, |view, cx| { view.reconnect(cx); window.focus(&view.focus, cx); cx.notify(); });
                     }
                     11 if snapshot.boot_id == boot && snapshot.workspaces.len() == 2 && snapshot.tabs.len() == 3
                         && focused_workspace == workspace && focused_tab == first_tab && has_output(&surface.frame, &marker) => {

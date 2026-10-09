@@ -276,41 +276,65 @@ fn save_failures_keep_only_the_final_diagnostic_line() {
 #[test]
 fn shell_arguments_and_catalog_roots_are_quoted() -> Result<()> {
     let request = Request::new("host", "Alice's $(printf INJECTED); device", "work")?;
-    let command = shell_command(
+    let setup = shell_command(
         "/a path/herdr",
         &request,
         &[("XDG_STATE_HOME".into(), "/state user's".into())],
     );
-    assert!(command.contains("'XDG_STATE_HOME=/state user'\\''s'"));
+    let command = &setup.command;
+    assert!(command.contains("\"XDG_STATE_HOME=$HERDR_GPUI_SETUP_XDG_STATE_HOME\""));
+    assert!(command.contains("'-u' 'HERDR_GPUI_SETUP_XDG_STATE_HOME'"));
     assert!(command.contains("'/a path/herdr' 'machine' 'add' 'host'"));
     assert!(command.contains("'Alice'\\''s $(printf INJECTED); device'"));
     assert!(command.contains("'-u' 'HERDR_CONFIG_PATH'"));
+    assert_eq!(
+        setup.environment,
+        BTreeMap::from([(
+            "HERDR_GPUI_SETUP_XDG_STATE_HOME".to_owned(),
+            "/state user's".to_owned()
+        )])
+    );
     Ok(())
+}
+
+/// Splits the setup command the way a POSIX shell in the workspace would,
+/// with the workspace's launch environment, and returns its words.
+#[cfg(unix)]
+fn shell_words(setup: &TerminalSetup) -> Result<Vec<Vec<u8>>> {
+    let output = Command::new("/bin/sh")
+        .args([
+            "-c",
+            &format!("set -- {}; printf '%s\\0' \"$@\"", setup.command),
+        ])
+        .envs(&setup.environment)
+        .output()?;
+    assert!(output.status.success());
+    Ok(output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|value| !value.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect())
 }
 
 #[cfg(unix)]
 #[test]
 fn terminal_shell_preserves_exact_arguments_without_expansion() -> Result<()> {
     let request = Request::new("user@host", "Alice's $(printf INJECTED); device", "work")?;
-    let command = shell_command(
+    let setup = shell_command(
         "/a path/herdr",
         &request,
         &[("XDG_STATE_HOME".into(), "/state user's".into())],
     );
-    let output = Command::new("/bin/sh")
-        .args(["-c", &format!("set -- {command}; printf '%s\\0' \"$@\"")])
-        .output()?;
-    assert!(output.status.success());
-    let args: Vec<_> = output
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|value| !value.is_empty())
-        .collect();
+    let args = shell_words(&setup)?;
     assert_eq!(
         &args[args.len() - 7..],
         request.arguments().map(str::as_bytes).as_slice()
     );
-    assert!(args.contains(&b"XDG_STATE_HOME=/state user's".as_slice()));
-    assert!(args.contains(&b"/a path/herdr".as_slice()));
+    assert!(args.contains(&b"XDG_STATE_HOME=/state user's".to_vec()));
+    assert!(args.contains(&b"/a path/herdr".to_vec()));
     Ok(())
 }
+
+#[cfg(unix)]
+mod long_environment;

@@ -33,6 +33,29 @@ impl Cover {
             Self::Panel(panel) => page.is_some_and(|page| page.intersects(&panel)),
         }
     }
+
+    /// This cover if it was measured for `open`, the page open now; one
+    /// measured for another page is stale until this one is laid out.
+    pub(crate) fn settled(self, measured_for: Option<Page>, open: Option<Page>) -> Self {
+        if measured_for == open {
+            self
+        } else {
+            Self::Unknown
+        }
+    }
+}
+
+impl Cover {
+    /// What a dimmed dialog covers: the Herdr realm `realm` wide, or the
+    /// whole window when there is no other realm.
+    pub(crate) fn dimmed(realm: Option<Pixels>) -> Self {
+        realm.map_or(Self::All, |width| {
+            Self::Panel(gpui::Bounds::new(
+                gpui::point(gpui::px(0.), gpui::px(0.)),
+                gpui::size(width, gpui::px(f32::MAX / 4.)),
+            ))
+        })
+    }
 }
 
 pub(crate) struct MenuState {
@@ -44,6 +67,8 @@ pub(crate) struct MenuState {
     /// The saved distribution the removal confirmation names.
     pub(super) wsl_remove: Option<String>,
     pub(super) session_edit: Option<super::sessions::Edit>,
+    #[cfg(feature = "coder")]
+    pub(super) coder: Option<super::devices::coder::Wizard>,
     pub(super) devices_scroll: ScrollHandle,
     /// The sessions list scrolls its own way; the two popups never share one.
     pub(crate) sessions_scroll: ScrollHandle,
@@ -63,7 +88,7 @@ pub(crate) struct MenuState {
     pub(super) merge_target: Option<crate::pr_actions::Target>,
     pub(super) target: Option<WorkspaceTarget>,
     pub input: Option<DialogInput>,
-    pub(super) error: Option<String>,
+    pub(crate) error: Option<String>,
     pub(super) deletion: Option<Deletion>,
     pub(super) close_check: Option<super::workspace_close::CloseCheck>,
     /// The correlated `worktree.create` or `worktree.open` request, so the dialog
@@ -81,6 +106,7 @@ pub(crate) struct MenuState {
     pub(crate) themes: Option<crate::theme_picker::ThemePicker>,
     pub(crate) fonts: Option<crate::font_picker::FontPicker>,
     pub(crate) palette: Option<crate::palette::Palette>,
+    pub(crate) code_search: Option<crate::code_search::CodeSearch>,
     pub(crate) close: Option<crate::close_modal::CloseConfirmation>,
     pub(crate) tab: Option<crate::tab_menu::TabMenu>,
     pub(crate) group: Option<crate::group_menu::GroupMenu>,
@@ -88,6 +114,8 @@ pub(crate) struct MenuState {
     pub(crate) pane: Option<crate::pane_menu::PaneMenu>,
     /// The new worktree dialog's tabs and the GitHub listing behind them.
     pub(crate) worktree: Option<super::WorktreeSource>,
+    /// The host a new worktree or workspace goes to, when another one could.
+    pub(crate) dispatch: Option<crate::dispatch::Picker>,
     pub(crate) pr: crate::pull_request::Lookup,
     /// Also read by the sidebar, which paints each worktree's cached PR badge.
     pub(crate) pr_cache: crate::pull_request::Cache,
@@ -180,6 +208,15 @@ impl Submission {
 }
 
 impl MenuState {
+    /// The repository the open dialog's host picker ranks hosts for.
+    pub(crate) fn dispatch_repo(&self) -> Option<String> {
+        self.target
+            .as_ref()?
+            .worktree
+            .as_ref()
+            .map(|tree| tree.label.clone())
+    }
+
     pub(super) fn apply_deletion_response(
         &mut self,
         id: &str,
@@ -243,6 +280,8 @@ impl MenuState {
             wsl_setup: None,
             wsl_remove: None,
             session_edit: None,
+            #[cfg(feature = "coder")]
+            coder: None,
             devices_scroll: ScrollHandle::new(),
             sessions_scroll: ScrollHandle::new(),
             usage_scroll: ScrollHandle::new(),
@@ -271,6 +310,7 @@ impl MenuState {
             themes: None,
             fonts: None,
             palette: None,
+            code_search: None,
             close: None,
             pr: Default::default(),
             pr_cache: Default::default(),
@@ -288,6 +328,7 @@ impl MenuState {
             host: None,
             pane: None,
             worktree: None,
+            dispatch: None,
         }
     }
 
@@ -297,6 +338,10 @@ impl MenuState {
         self.wsl_setup = None;
         self.wsl_remove = None;
         self.session_edit = None;
+        #[cfg(feature = "coder")]
+        {
+            self.coder = None;
+        }
         self.devices_scroll.set_offset(Point::default());
         self.sessions_scroll.set_offset(Point::default());
         self.usage_scroll.set_offset(Point::default());
@@ -312,6 +357,7 @@ impl MenuState {
         }
         self.page = None;
         self.palette = None;
+        self.code_search = None;
         self.fonts = None;
         self.font_size_editor = None;
         self.selected = None;
@@ -330,6 +376,7 @@ impl MenuState {
         self.worktree_open = None;
         self.close = None;
         self.worktree = None;
+        self.dispatch = None;
         self.pr.clear();
         self.pr_connection = None;
     }

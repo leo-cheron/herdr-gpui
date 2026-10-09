@@ -2,6 +2,7 @@
 // Not `super::*`: it brings in `gpui::test`, which `#[test]` would then name.
 use super::{Agent, HerdrWindow, Loaded, State, pick_agent};
 use crate::browser::TabId;
+use crate::review::diff::{Diff, RowId};
 
 /// The window's one review tab.
 fn the(view: &HerdrWindow) -> TabId {
@@ -68,19 +69,21 @@ fn window<'a>(
     })
 }
 
+/// One file's change, read: its hunk header (line 0), an unchanged line
+/// (1), a removed line (2) and the added line that replaced it (3).
 fn changes() -> Loaded {
-    Loaded {
-        checkout: "/work/repo".into(),
-        scope: super::Scope::Uncommitted,
-        base: None,
-        diff: super::super::diff::Diff::parse(
-            "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n fn a() {}\n-fn b() {}\n+fn b() { todo!() }\n",
-        ),
-    }
+    Loaded::of(Diff::parse(
+        "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n fn a() {}\n-fn b() {}\n+fn b() { todo!() }\n",
+    ))
+}
+
+/// Line `line` of the first file.
+fn line(line: usize) -> RowId {
+    RowId::Line { file: 0, line }
 }
 
 /// Writes `comment` on diff row `row`, the way a click and typing would.
-fn note(view: &Entity<HerdrWindow>, cx: &mut gpui::VisualTestContext, row: usize, comment: &str) {
+fn note(view: &Entity<HerdrWindow>, cx: &mut gpui::VisualTestContext, row: RowId, comment: &str) {
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
             view.begin_review_note(the(view), row, window, cx);
@@ -104,20 +107,23 @@ fn notes_on_lines_reach_the_agent_that_made_the_changes(cx: &mut gpui::TestAppCo
     cx.update(|window, cx| view.update(cx, |view, cx| view.seed_review(changes(), window, cx)));
     cx.update(|window, cx| crate::sidebar::layout_tests::full_draw(window, cx).clear(cx));
     // Hunk headers take no notes; an empty note is refused.
-    note(&view, cx, 1, "ignored");
-    note(&view, cx, 4, "   ");
-    note(&view, cx, 4, "Implement this");
-    note(&view, cx, 0, "Add a test");
+    note(&view, cx, line(0), "ignored");
+    note(&view, cx, line(3), "   ");
+    note(&view, cx, line(3), "Implement this");
+    note(&view, cx, RowId::Header(0), "Add a test");
     view.read_with(cx, |view, _| {
         let review = view.reviews.values().next().unwrap();
         assert_eq!(review.notes.len(), 2);
-        assert_eq!(review.marks, HashMap::from([(4, 1), (0, 2)]));
+        assert_eq!(
+            review.marks,
+            HashMap::from([(line(3), 1), (RowId::Header(0), 2)])
+        );
         assert!(review.draft.is_none());
     });
     cx.update(|window, cx| crate::sidebar::layout_tests::full_draw(window, cx).clear(cx));
     // Every row spans the list, whatever its text, so tints line up.
-    let file = cx.debug_bounds("review-row-0").unwrap();
-    let added = cx.debug_bounds("review-row-4").unwrap();
+    let file = cx.debug_bounds("review-header-0").unwrap();
+    let added = cx.debug_bounds("review-line-0-3").unwrap();
     assert_eq!(file.size.width, added.size.width);
     assert!(file.size.width > gpui::px(400.));
 
@@ -157,7 +163,7 @@ fn notes_on_lines_reach_the_agent_that_made_the_changes(cx: &mut gpui::TestAppCo
 fn without_an_agent_the_notes_are_copied(cx: &mut gpui::TestAppContext) {
     let (view, cx) = window(cx, None);
     cx.update(|window, cx| view.update(cx, |view, cx| view.seed_review(changes(), window, cx)));
-    note(&view, cx, 3, "Why remove this?");
+    note(&view, cx, line(2), "Why remove this?");
     cx.update(|_, cx| view.update(cx, |view, cx| view.send_review(the(view), cx)));
     let copied = cx
         .update(|_, cx| cx.read_from_clipboard())
@@ -206,10 +212,19 @@ fn notes_go_to_the_focused_agent_or_the_workspace_s_first() {
     assert!(pick_agent(&snapshot(base(None, vec![agent("w0:p1", "w0", None)]))).is_none());
 }
 
+mod colours;
+mod editor;
 mod files;
+mod find_again;
+mod keys;
 mod layout;
+mod loading;
 mod resize;
+mod scale;
 mod scope;
 mod scrollbar;
+mod search;
+mod selection;
 mod split_resize;
 mod tab;
+mod wrap;

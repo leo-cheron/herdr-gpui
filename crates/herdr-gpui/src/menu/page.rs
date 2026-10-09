@@ -18,6 +18,9 @@ pub(crate) enum Page {
     /// Names a saved SSH device's port to forward to this computer.
     ForwardPort,
     RemoveDevice,
+    /// Sign in to Coder and add one of its workspaces as a device.
+    #[cfg(feature = "coder")]
+    AddCoder,
     /// Picking a WSL distribution to save as a device.
     AddWsl,
     /// Confirming a saved WSL distribution should be forgotten.
@@ -26,6 +29,8 @@ pub(crate) enum Page {
     Themes,
     Fonts,
     Palette,
+    /// Go to Symbol and Go to File over the focused pane's checkout.
+    CodeSearch,
     ConfirmClose,
     Update,
     AppUpdate,
@@ -36,7 +41,8 @@ pub(crate) enum Page {
     AgentSkill,
     Tab,
     RenameTab,
-    /// A group's "…" menu: closing tabs and splitting.
+    /// A group's "…" menu: opening tabs other than a terminal, closing
+    /// tabs, and splitting.
     Group,
     Pane,
     RenamePane,
@@ -77,6 +83,8 @@ pub(crate) enum WorkspaceAction {
     /// Names a workspace before `workspace.create`, when
     /// `ui.prompt_new_workspace_name` asks. Targets the source workspace.
     NewWorkspace,
+    /// Writes the note this app keeps on the checkout; never a daemon request.
+    Note,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,6 +109,32 @@ pub(crate) enum WorkspaceMenuAction {
     Script(crate::worktree_scripts::ScriptKind),
 }
 
+impl Page {
+    /// Context menus open where the pointer asked for them, rather than
+    /// centred over a dimmed window as a dialog is.
+    pub(crate) fn pointer_anchored(self) -> bool {
+        matches!(
+            self,
+            Self::Workspace
+                | Self::Tab
+                | Self::RenameTab
+                | Self::Group
+                | Self::Pane
+                | Self::RenamePane
+                | Self::PaneProcesses
+                | Self::KillProcesses
+                | Self::Host
+                | Self::RemoveDevice
+                | Self::RemoveWsl
+                | Self::Git
+                | Self::GitCommit
+                | Self::PrReview
+                | Self::PrComment
+                | Self::PrMerge
+        )
+    }
+}
+
 impl WorkspaceMenuAction {
     /// Embedded icon for the row, so each action is recognizable before reading.
     /// The pull request section draws its own header rather than a menu row.
@@ -111,6 +145,7 @@ impl WorkspaceMenuAction {
             Self::Dialog(WorkspaceAction::NewWorktree) => "icons/plus.svg",
             Self::Dialog(WorkspaceAction::OpenWorktree) => "icons/chevron-down.svg",
             Self::Dialog(WorkspaceAction::DeleteWorktree) => "icons/trash.svg",
+            Self::Dialog(WorkspaceAction::Note) => "icons/note.svg",
             Self::Dialog(WorkspaceAction::NewTab | WorkspaceAction::NewWorkspace) => {
                 "icons/plus.svg"
             }

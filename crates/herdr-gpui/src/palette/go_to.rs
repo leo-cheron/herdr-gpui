@@ -1,7 +1,8 @@
 //! Go To rows: every workspace, tab, pane, and agent on each connected host,
-//! and the check that a chosen destination still exists.
+//! the checkouts the user keeps notes on, and the check that a chosen
+//! destination still exists.
 
-use super::{Action, Entry, projects};
+use super::{Action, Entry, Source, projects};
 use crate::{Error, NavigationTarget, Result};
 use gpui::SharedString;
 use herdr_client::protocol::{AgentStatus, ClientShellSnapshot};
@@ -159,6 +160,56 @@ pub(super) fn go_to_entries(
                     &keywords,
                 ));
             }
+        }
+    }
+}
+
+/// A row for each open workspace whose checkout has a note, most recently
+/// edited note first, titled by the workspace and detailed by the note so a
+/// search finds either. A note on a checkout no host has open has nowhere to
+/// go, so it is left out.
+pub(super) fn note_entries(
+    notes: &crate::worktree_notes::Notes,
+    sources: &[Source],
+    endpoints: &[crate::endpoint::Endpoint],
+    entries: &mut Vec<Entry>,
+) {
+    for note in notes.recent() {
+        let checkout = &note.checkout;
+        let Some(snapshot) = sources
+            .iter()
+            .find(|source| source.endpoint == checkout.endpoint && source.enabled)
+            .and_then(|source| source.snapshot.as_ref())
+        else {
+            continue;
+        };
+        let host = (endpoints.len() > 1)
+            .then(|| endpoints.iter().find(|e| e.id == checkout.endpoint))
+            .flatten()
+            .map(|endpoint| endpoint.label.as_str());
+        for workspace in snapshot.workspaces.iter().filter(|w| {
+            w.branch.as_deref() == Some(checkout.branch.as_str())
+                && w.worktree
+                    .as_ref()
+                    .is_some_and(|tree| tree.key == checkout.repo_key)
+        }) {
+            let detail = [host, Some(note.text.as_str())]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("  ");
+            entries.push(Entry::with_keywords(
+                workspace.label.clone(),
+                detail,
+                "Note",
+                Action::Note {
+                    endpoint: checkout.endpoint.clone(),
+                    boot: snapshot.boot_id.clone(),
+                    workspace: workspace.workspace_id.clone(),
+                },
+                None,
+                &checkout.branch,
+            ));
         }
     }
 }

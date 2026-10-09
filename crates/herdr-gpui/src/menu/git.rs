@@ -12,8 +12,6 @@ use gpui::{prelude::*, *};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Row {
-    /// The diff of the checkout's changes, in a review tab.
-    ReviewChanges,
     Commit,
     Push,
     PullRequest,
@@ -25,7 +23,6 @@ pub(super) enum Row {
 impl Row {
     pub(super) fn icon(self) -> &'static str {
         match self {
-            Self::ReviewChanges => "icons/zoom.svg",
             Self::Commit => "icons/pencil.svg",
             Self::Push => "icons/chevron-up.svg",
             Self::PullRequest => "icons/git-branch.svg",
@@ -148,7 +145,7 @@ impl HerdrWindow {
             self.sync_pr_scope();
             self.menu.pr_cache.refresh(input, std::time::Instant::now());
         }
-        self.marked.clear();
+        self.discard_composition(cx);
         window.focus(&self.menu.focus, cx);
         cx.notify();
     }
@@ -160,7 +157,11 @@ impl HerdrWindow {
         self.menu
             .github
             .connected()
-            .then(|| self.menu.pr_cache.peek(&input.repo_key, &input.branch))
+            .then(|| {
+                self.menu
+                    .pr_cache
+                    .peek(input.repo_key.as_deref()?, &input.branch)
+            })
             .flatten()
     }
 
@@ -185,7 +186,6 @@ impl HerdrWindow {
             return Vec::new();
         }
         let mut rows = vec![
-            (Row::ReviewChanges, "Review changes...".into()),
             (Row::Commit, "Commit...".into()),
             (Row::Push, "Push".into()),
             match self.git_open_pull_request() {
@@ -222,10 +222,6 @@ impl HerdrWindow {
             return;
         }
         match row {
-            Row::ReviewChanges => {
-                self.open_review(window, cx);
-                return;
-            }
             Row::Commit => {
                 self.menu.page = Some(Page::GitCommit);
                 self.menu.input = Some(DialogInput::default());

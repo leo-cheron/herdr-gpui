@@ -29,7 +29,7 @@ fn scrollbar_drag_survives_a_snapshot_ahead_of_its_surface(cx: &mut gpui::TestAp
     };
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            prepare_mouse(view, endpoint);
+            prepare_mouse(view, endpoint, cx);
             let pane = &mut Arc::make_mut(view.live.surface.as_mut().unwrap()).panes[0];
             pane.scrollbar_rect = Some(SurfaceRect {
                 x: 38,

@@ -49,7 +49,7 @@ running another terminal emulator or wrapping the TUI.
     <td colspan="2">
       <img src="docs/screenshots/review.png" alt="Review tab showing a unified diff of uncommitted changes with syntax colouring, a changed-files list, and two numbered review notes ready to send to Claude">
       <br>
-      <sub><b><a href="crates/herdr-gpui/README.md#reviewing-an-agents-changes">Review an agent's changes</a>.</b> Open <b>Review changes…</b> from the title bar's Git menu, click any line to leave a note like a pull request comment, then <b>Send to agent</b>.</sub>
+      <sub><b><a href="crates/herdr-gpui/README.md#reviewing-an-agents-changes">Review an agent's changes</a>.</b> Open <b>Review Changes</b> from a tab strip's <b>+</b> menu, click any line to leave a note like a pull request comment, then <b>Send to agent</b>.</sub>
     </td>
   </tr>
   <tr>
@@ -101,6 +101,8 @@ running another terminal emulator or wrapping the TUI.
 Also included: saved SSH hosts with [file copies](crates/herdr-gpui/README.md#ssh-file-copies),
 [inline images](crates/herdr-gpui/README.md#images),
 [clickable links](crates/herdr-gpui/README.md#terminal-links),
+[code navigation](crates/herdr-gpui/README.md#code-navigation) that jumps to a
+symbol, file, or printed `path:line` in your terminal editor,
 [file drops](crates/herdr-gpui/README.md#file-drops),
 [editor groups](crates/herdr-gpui/README.md#editor-groups), and
 [system notifications](crates/herdr-gpui/README.md#system-notifications),

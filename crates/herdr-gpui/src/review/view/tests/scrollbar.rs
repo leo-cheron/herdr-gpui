@@ -1,6 +1,6 @@
 //! The diff's scrollbar.
 use super::{changes, the, window};
-use crate::review::diff::{Diff, Scope};
+use crate::review::diff::Diff;
 use crate::review::view::Loaded;
 
 fn draw(cx: &mut gpui::VisualTestContext) {
@@ -10,13 +10,8 @@ fn draw(cx: &mut gpui::VisualTestContext) {
 fn long() -> Loaded {
     let mut diff = Diff::default();
     let text: String = (0..400).map(|line| format!("line {line}\n")).collect();
-    diff.add_untracked("long.rs", Some(&text));
-    Loaded {
-        checkout: "/work/repo".into(),
-        scope: Scope::Uncommitted,
-        base: None,
-        diff,
-    }
+    diff.add_untracked("long.rs", &text);
+    Loaded::of(diff)
 }
 
 #[gpui::test]
@@ -26,7 +21,7 @@ fn a_long_diff_has_a_thumb_that_drags_it(cx: &mut gpui::TestAppContext) {
     // The list lays out once before its handle knows how far it scrolls.
     draw(cx);
     draw(cx);
-    let area = cx.debug_bounds("review-row-0").unwrap();
+    let area = cx.debug_bounds("review-header-0").unwrap();
     let thumb = cx.debug_bounds("review-scroll-thumb").unwrap();
     assert!(
         (thumb.top() - area.top()).abs() < gpui::px(1.),
@@ -47,11 +42,11 @@ fn a_long_diff_has_a_thumb_that_drags_it(cx: &mut gpui::TestAppContext) {
     let moved = cx.debug_bounds("review-scroll-thumb").unwrap();
     assert!(moved.top() > thumb.top() + gpui::px(100.), "{moved:?}");
     assert!(
-        cx.debug_bounds("review-row-0").is_none(),
+        cx.debug_bounds("review-header-0").is_none(),
         "scrolled past the top"
     );
     assert!(
-        cx.debug_bounds("review-row-401").is_some(),
+        cx.debug_bounds("review-line-0-400").is_some(),
         "the last line shows"
     );
 }
@@ -62,6 +57,6 @@ fn a_diff_that_fits_has_no_thumb(cx: &mut gpui::TestAppContext) {
     cx.update(|window, cx| view.update(cx, |view, cx| view.seed_review(changes(), window, cx)));
     draw(cx);
     draw(cx);
-    assert!(cx.debug_bounds("review-row-0").is_some());
+    assert!(cx.debug_bounds("review-header-0").is_some());
     assert!(cx.debug_bounds("review-scroll-thumb").is_none());
 }

@@ -6,6 +6,7 @@ use herdr_client::Method;
 
 mod close;
 mod dialog_layout;
+mod dispatch;
 mod naming;
 mod pull_requests;
 mod scripts;
@@ -22,6 +23,13 @@ pub(crate) fn submit_dialog(
     cx: &mut gpui::Context<HerdrWindow>,
 ) {
     view.submit_workspace_dialog(window, cx);
+}
+
+/// Whether the open workspace menu offers a note, for tests outside this module.
+pub(crate) fn offers_note(view: &HerdrWindow) -> bool {
+    view.workspace_items()
+        .iter()
+        .any(|(action, _)| *action == WorkspaceMenuAction::Dialog(WorkspaceAction::Note))
 }
 
 /// The workspace a menu currently targets, for tests outside this module.

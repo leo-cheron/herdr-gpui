@@ -6,6 +6,75 @@ use gpui::*;
 use herdr_client::protocol::ClientPaneInputEvent;
 use std::ops::Range;
 
+#[cfg(target_os = "linux")]
+mod linux;
+// The platform input handler for every view-backed text field. It is not named
+// ElementInputHandler, so a `gpui::*` glob cannot silently replace it with
+// GPUI's strong handler on Linux.
+#[cfg(not(target_os = "linux"))]
+pub(crate) use gpui::ElementInputHandler as ViewInputHandler;
+#[cfg(target_os = "linux")]
+pub(crate) use linux::WeakInputHandler as ViewInputHandler;
+
+/// Which Option keys the keystroke being handled was made with. GPUI's
+/// modifiers merge the two, so macOS's event in progress is asked; a key
+/// event is handled while AppKit dispatches it, so that event is this one.
+#[cfg(target_os = "macos")]
+pub(crate) fn held_option_keys() -> crate::config::OptionKeys {
+    use crate::config::OptionKeys;
+    let Some(mtm) = objc2::MainThreadMarker::new() else {
+        return OptionKeys::LEFT;
+    };
+    objc2_app_kit::NSApplication::sharedApplication(mtm)
+        .currentEvent()
+        .map_or(OptionKeys::LEFT, |event| {
+            OptionKeys::from_device_flags(event.modifierFlags().0)
+        })
+}
+
+/// Tells macOS's input method to drop its composition, once the update
+/// that dropped the window's own has finished: the input method may call
+/// back into the window, which must not be in use then.
+#[cfg(target_os = "macos")]
+fn discard_platform_composition(cx: &mut Context<HerdrWindow>) {
+    cx.spawn(async move |_, _| {
+        if let Some(mtm) = objc2::MainThreadMarker::new()
+            && let Some(input) = objc2_app_kit::NSTextInputContext::currentInputContext(mtm)
+        {
+            input.discardMarkedText();
+        }
+    })
+    .detach();
+}
+
+/// Elsewhere the platform keeps no composition the window must end.
+#[cfg(not(target_os = "macos"))]
+fn discard_platform_composition(_: &mut Context<HerdrWindow>) {}
+
+impl HerdrWindow {
+    /// Drops the terminal's composition, here and in the platform's input
+    /// method, when its pane or connection changes under it. Otherwise the
+    /// next keystroke would carry on the dropped text into the new pane.
+    pub(crate) fn discard_composition(&mut self, cx: &mut Context<Self>) {
+        if self.marked.is_empty() {
+            return;
+        }
+        self.marked.clear();
+        self.marked_selection = None;
+        #[cfg(feature = "integration-test")]
+        {
+            self.input_probe.compositions_discarded += 1;
+        }
+        discard_platform_composition(cx);
+    }
+}
+
+/// Elsewhere Alt has no sides that matter: it always reaches the pane.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn held_option_keys() -> crate::config::OptionKeys {
+    crate::config::OptionKeys::LEFT
+}
+
 impl EntityInputHandler for HerdrWindow {
     fn text_for_range(
         &mut self,
@@ -39,8 +108,13 @@ impl EntityInputHandler for HerdrWindow {
             });
         }
         let end = self.marked.encode_utf16().count();
+        let range = self
+            .marked_selection
+            .clone()
+            .filter(|range| range.start <= range.end && range.end <= end)
+            .unwrap_or(end..end);
         Some(UTF16Selection {
-            range: end..end,
+            range,
             reversed: false,
         })
     }
@@ -56,6 +130,7 @@ impl EntityInputHandler for HerdrWindow {
             input.marked = None;
         }
         self.marked.clear();
+        self.marked_selection = None;
         cx.notify();
     }
     fn replace_text_in_range(
@@ -82,6 +157,7 @@ impl EntityInputHandler for HerdrWindow {
             self.input_probe.text += 1;
         }
         self.marked.clear();
+        self.marked_selection = None;
         if !text.is_empty() {
             self.send(ClientPaneInputEvent::TextCommit(text.into()), cx);
         }
@@ -108,6 +184,9 @@ impl EntityInputHandler for HerdrWindow {
             return;
         }
         self.marked = text.into();
+        // The IME's caret, or the clause it is converting, so it asks for
+        // the candidate window's place there rather than after the text.
+        self.marked_selection = selected;
         cx.notify();
     }
     fn bounds_for_range(
@@ -153,14 +232,14 @@ impl EntityInputHandler for HerdrWindow {
 /// it opts out of macOS press-and-hold, which would otherwise swallow the
 /// repeats and open the accent picker. Menu text fields keep the picker.
 pub(crate) struct TerminalInputHandler {
-    inner: ElementInputHandler<HerdrWindow>,
+    inner: ViewInputHandler<HerdrWindow>,
     press_and_hold: bool,
 }
 
 impl TerminalInputHandler {
     pub(crate) fn new(bounds: Bounds<Pixels>, view: Entity<HerdrWindow>, menu_open: bool) -> Self {
         Self {
-            inner: ElementInputHandler::new(bounds, view),
+            inner: ViewInputHandler::new(bounds, view),
             press_and_hold: menu_open,
         }
     }

@@ -1,14 +1,15 @@
 //! The status bar's usage segments: per agent, a meter for the window closest
-//! to its limit and each window's share used with its time to reset. A click
-//! opens that agent's panel, so the bar stays one quiet line; picking a tab
-//! there brings that agent to the front of the bar.
+//! to its limit and the tightest windows' shares used with their time to
+//! reset, or in compact mode the tightest share alone. A click opens that
+//! agent's panel, so the bar stays one quiet line; picking a tab there brings
+//! that agent to the front of the bar.
 
 use super::{
     Reading,
     model::{Severity, Window as Limit},
     panel::PANEL_GAP,
 };
-use crate::window::HerdrWindow;
+use crate::{config::status_bar::Detail, window::HerdrWindow};
 use gpui::{prelude::*, *};
 use std::{
     cell::Cell,
@@ -17,6 +18,9 @@ use std::{
 };
 
 const METER_WIDTH: f32 = 40.;
+/// Windows a detailed segment names at most; the panel lists the rest. A
+/// service with many model quotas would otherwise crowd out the whole bar.
+pub(super) const BAR_WINDOWS: usize = 2;
 
 impl HerdrWindow {
     /// The provider chosen in the panel, then those closest to a limit, at
@@ -184,24 +188,37 @@ impl HerdrWindow {
                 )
             });
         };
-        if let Some(tightest) = report.tightest() {
-            segment = segment.child(meter(tightest, theme));
-        }
         let mut labels = div()
             .flex()
             .min_w_0()
             .overflow_hidden()
             .whitespace_nowrap()
             .gap(px(4.));
-        for (index, window) in report.windows.iter().enumerate() {
-            if index > 0 {
-                labels = labels.child(div().text_color(rgb(theme.muted)).child("·"));
+        match self.config.status_bar.usage {
+            Detail::Compact => {
+                if let Some(tightest) = report.tightest() {
+                    labels = labels.child(
+                        div()
+                            .text_color(rgb(color(tightest.used.into(), theme, theme.foreground)))
+                            .child(format!("{}%", tightest.percent())),
+                    );
+                }
             }
-            labels = labels.child(
-                div()
-                    .text_color(rgb(color(window.used.into(), theme, theme.foreground)))
-                    .child(window.label(now)),
-            );
+            Detail::Detailed => {
+                if let Some(tightest) = report.tightest() {
+                    segment = segment.child(meter(tightest, theme));
+                }
+                for (index, window) in bar_windows(&report.windows).enumerate() {
+                    if index > 0 {
+                        labels = labels.child(div().text_color(rgb(theme.muted)).child("·"));
+                    }
+                    labels = labels.child(
+                        div()
+                            .text_color(rgb(color(window.used.into(), theme, theme.foreground)))
+                            .child(window.label(now)),
+                    );
+                }
+            }
         }
         // A service that meters money or credits rather than a window shows
         // what is left or spent.
@@ -222,6 +239,17 @@ impl HerdrWindow {
                 )
             })
     }
+}
+
+/// The [`BAR_WINDOWS`] windows closest to their limits, in report order so
+/// the session window keeps its place before the weekly one.
+pub(super) fn bar_windows(windows: &[Limit]) -> impl Iterator<Item = &Limit> {
+    let mut tightest: Vec<usize> = (0..windows.len()).collect();
+    // Stable, so equally used windows keep report order.
+    tightest.sort_by(|&a, &b| windows[b].used.total_cmp(&windows[a].used));
+    tightest.truncate(BAR_WINDOWS);
+    tightest.sort_unstable();
+    tightest.into_iter().map(|index| &windows[index])
 }
 
 fn color(severity: Severity, theme: &crate::config::Theme, normal: u32) -> u32 {

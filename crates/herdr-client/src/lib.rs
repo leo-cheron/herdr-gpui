@@ -44,7 +44,9 @@ pub use catalog::{
 };
 pub use clipboard::{ClipboardImageCancellation, ClipboardImageUpload};
 pub use compat::{MIN_HERDR_VERSION, VersionMismatch};
-pub use connect::{connect, connect_with_connector, connect_with_surface_active};
+pub use connect::{Transport, connect, connect_with_connector, connect_with_surface_active};
+#[cfg(feature = "cloud")]
+pub use discovery::CloudProvider;
 pub use discovery::{ConnectTarget, session_socket};
 /// Error returned when queueing commands; also available as the crate's `Error`.
 pub use error::Error as SendError;
@@ -63,9 +65,10 @@ pub use sessions::{
 };
 #[cfg(unix)]
 pub use ssh::script_command;
+pub use ssh::{Bridge, connect_command};
 pub use ssh::{
-    Destination, FORWARD_READY, HostProbe, forward_command, probe_host, remote_config_value,
-    remote_origin_url, resolve_destination,
+    Destination, FORWARD_READY, HostProbe, SshFailure, forward_command, probe_host,
+    remote_config_value, remote_origin_url, resolve_destination,
 };
 pub use surface_images::{
     MAX_IMAGE_BYTES, MAX_IMAGE_SIDE, MAX_IMAGES, MAX_PLACEMENTS, SurfaceImage, SurfaceImages,

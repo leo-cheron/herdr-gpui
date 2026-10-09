@@ -276,6 +276,7 @@ fn disconnect_boot_and_detach_cancel_pending_and_queued_generations() {
         } else {
             state.apply(ClientEvent::Disconnected {
                 reason: "test".into(),
+                ssh: None,
             });
         }
         assert!(token.load(Ordering::Acquire));
@@ -357,7 +358,10 @@ fn preview_uses_builtin_on_worker_despite_notification_mute() {
         .as_ref()
         .unwrap()
         .send(Job {
-            request: PlaybackRequest::Notification(event(Kind::Custom)),
+            request: PlaybackRequest::Notification {
+                boot: None,
+                event: event(Kind::Custom),
+            },
             cancel: Arc::new(AtomicBool::new(false)),
             connection_cancel: Arc::new(AtomicBool::new(false)),
             queued: Instant::now(),
@@ -420,7 +424,10 @@ fn worker_continues_after_backend_error_without_replaying() {
             .as_ref()
             .unwrap()
             .send(Job {
-                request: PlaybackRequest::Notification(notification),
+                request: PlaybackRequest::Notification {
+                    boot: None,
+                    event: notification,
+                },
                 cancel: Arc::new(AtomicBool::new(false)),
                 connection_cancel: Arc::new(AtomicBool::new(false)),
                 queued: Instant::now(),
@@ -444,7 +451,10 @@ fn worker_drops_cancelled_and_expired_jobs_without_playing_them() {
             .as_ref()
             .unwrap()
             .send(Job {
-                request: PlaybackRequest::Notification(event(Kind::Custom)),
+                request: PlaybackRequest::Notification {
+                    boot: None,
+                    event: event(Kind::Custom),
+                },
                 cancel: Arc::new(AtomicBool::new(cancelled)),
                 connection_cancel: Arc::new(AtomicBool::new(false)),
                 queued: Instant::now() - Duration::from_secs(age),
@@ -461,3 +471,5 @@ fn worker_drops_cancelled_and_expired_jobs_without_playing_them() {
         Err(mpsc::RecvTimeoutError::Disconnected)
     ));
 }
+
+mod repeats;

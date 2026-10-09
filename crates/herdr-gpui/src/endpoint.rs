@@ -5,7 +5,7 @@ use super::{
     state::ConnectionStatus,
 };
 use gpui::Context;
-use herdr_client::{ClientHandle, ConnectOptions, ConnectTarget, VersionMismatch};
+use herdr_client::{ClientHandle, ConnectOptions, ConnectTarget, SshFailure, VersionMismatch};
 use std::{
     collections::HashSet,
     sync::{
@@ -17,8 +17,10 @@ use std::{
 
 mod catalog;
 mod polling;
+mod wake;
 
 pub(super) use catalog::Catalog;
+pub(super) use wake::WakeClock;
 
 pub(super) const LOCAL: &str = "local";
 /// Saved SSH endpoints are keyed `ssh:<profile-id>`, so no catalog ID can
@@ -149,6 +151,9 @@ pub(super) struct Endpoint {
     retry_at: Instant,
     attempts: u32,
     online_since: Option<Instant>,
+    /// Why the last connection ended, from the drop until a replacement has a
+    /// snapshot. Each retry replaces `live`, so the outage outlives it here.
+    outage: Option<String>,
     detached: bool,
     initial_surface: bool,
     sounds: crate::sound::Policy,
@@ -200,6 +205,7 @@ impl Endpoint {
             retry_at: Instant::now(),
             attempts: 0,
             online_since: None,
+            outage: None,
             detached: false,
             initial_surface: false,
             sounds: Default::default(),
@@ -239,6 +245,7 @@ impl Endpoint {
     /// connection produced survives it.
     fn retarget(&mut self, target: ConnectTarget) {
         self.stop();
+        self.outage = None;
         self.connection = ConnectionBridge::new(target);
         self.detached = false;
         self.attempts = 0;
@@ -285,6 +292,21 @@ impl Endpoint {
             } else if state.status.is_connected() {
                 self.version_mismatch = None;
             }
+            // The worker stops the handle before its disconnect state reaches
+            // the inbox, so a drop already seen learns its reason here.
+            if self.connection.handle.is_none()
+                && self.outage.is_some()
+                && !state.status.is_connected()
+            {
+                if let Some(error) = &state.error {
+                    self.outage = Some(error.clone());
+                }
+                let needs_user =
+                    |live: &LiveState| live.ssh_failure.is_some_and(SshFailure::needs_user);
+                if needs_user(&state) && !needs_user(&self.live) {
+                    self.retry_at = self.retry_at.max(now + MAX_RETRY_DELAY);
+                }
+            }
             self.live = state;
             self.sync_live();
         }
@@ -295,13 +317,27 @@ impl Endpoint {
             .is_some_and(ClientHandle::is_disconnected)
         {
             self.connection.handle = None;
-            self.retry_at = now + self.retry_delay();
+            // A host that refused for a reason only the user can fix is not
+            // redialled every few seconds meanwhile.
+            let delay = if self.live.ssh_failure.is_some_and(SshFailure::needs_user) {
+                MAX_RETRY_DELAY
+            } else {
+                self.retry_delay()
+            };
+            self.retry_at = now + delay;
+            self.outage = Some(
+                self.live
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "connection lost".into()),
+            );
             changed = Redraw::Window;
         }
         if self.connection.handle.is_some()
             && self.live.status.is_connected()
             && self.live.snapshot.is_some()
         {
+            self.outage = None;
             let since = self.online_since.get_or_insert(now);
             if now.duration_since(*since) >= STABLE_CONNECTION_PERIOD {
                 self.attempts = 0;
@@ -310,6 +346,17 @@ impl Endpoint {
             self.online_since = None;
         }
         changed
+    }
+
+    /// Dial again at once, keeping the backoff earned so far for any later
+    /// failure. Detached and disabled endpoints stay as they are.
+    fn retry_now(&mut self, now: Instant) {
+        self.retry_at = self.retry_at.min(now);
+    }
+
+    /// Why the endpoint is reconnecting, while it is.
+    pub(crate) fn outage(&self) -> Option<&str> {
+        self.outage.as_deref()
     }
 
     fn retry_delay(&self) -> Duration {
@@ -321,13 +368,17 @@ impl Endpoint {
             "disabled"
         } else if self.detached {
             "detached"
-        } else if self.live.status.is_connected() {
-            "online"
         } else if let Some(mismatch) = &self.version_mismatch {
+            // A refused handshake is an outage too, but says what fixes it.
             match mismatch {
                 VersionMismatch::DaemonOutdated { .. } => "Herdr update needed",
                 VersionMismatch::ClientOutdated { .. } => "app update needed",
             }
+        } else if self.outage.is_some() {
+            // Before `live`: a stopped handle can precede its disconnect state.
+            "reconnecting"
+        } else if self.live.status.is_connected() {
+            "online"
         } else if self.live.error.is_some() {
             "reconnecting"
         } else {
@@ -381,7 +432,7 @@ impl HerdrWindow {
         selected_changed
     }
 
-    pub(super) fn reconnect(&mut self) {
+    pub(super) fn reconnect(&mut self, cx: &mut Context<Self>) {
         let index = self.selected_endpoint;
         if !self.endpoints[index].enabled {
             return;
@@ -390,21 +441,22 @@ impl HerdrWindow {
         self.version_notice_shown = false;
         self.endpoints[index].attempts = 0;
         self.endpoints[index].connect(self.options, index == 0);
-        self.reset_selected();
+        self.reset_selected(cx);
     }
 
-    pub(super) fn detach_endpoint(&mut self) {
+    pub(super) fn detach_endpoint(&mut self, cx: &mut Context<Self>) {
         let endpoint = &mut self.endpoints[self.selected_endpoint];
         endpoint.stop();
+        endpoint.outage = None;
         endpoint.detached = true;
         endpoint.live.status = ConnectionStatus::Detached;
         if let Ok(mut state) = endpoint.connection.inbox.lock() {
             *state = endpoint.live.clone();
         }
-        self.reset_selected();
+        self.reset_selected(cx);
     }
 
-    pub(super) fn reset_selected(&mut self) {
+    pub(super) fn reset_selected(&mut self, cx: &mut Context<Self>) {
         if let Some(transfer) = &self.file_transfer {
             transfer.cancel();
         }
@@ -414,21 +466,24 @@ impl HerdrWindow {
         self.clear_pending_input();
         self.menu.reset();
         self.selection_epoch += 1;
+        self.discard_composition(cx);
         let endpoint = &self.endpoints[self.selected_endpoint];
         self.selected_generation = endpoint.generation;
         self.live = endpoint.live.clone();
         if !endpoint.initial_surface {
             self.live.surface = None;
         }
-        // Another connection's picture is not this one's, so a reconnect, a
-        // detach, or a switch of endpoint starts from an empty terminal area.
-        self.presentation.clear();
+        // Another connection's picture is not this one's, so a detach or a
+        // retarget starts from an empty terminal area. A reconnect after a drop
+        // keeps the last picture, dimmed, until the new connection's arrives.
+        if endpoint.outage.is_none() {
+            self.presentation.clear();
+        }
         self.selection = None;
         self.terminal_mouse = None;
         self.pressed_terminal_link = None;
         self.flash = None;
         self.local_error = None;
-        self.marked.clear();
         self.last_queued_options = None;
         self.sent_focus = None;
         self.wheel = WheelAccumulator::default();
@@ -484,7 +539,7 @@ impl HerdrWindow {
         // This is a deliberate move off any remote selection, which must not be
         // restored over it on the next launch.
         self.catalog.choose(LOCAL);
-        self.reconnect();
+        self.reconnect(cx);
         // After the reconnect: resetting the connection clears the error slot.
         if let Some(error) = self.catalog.poll_write() {
             self.local_error = Some(format!("Save host selection: {error}"));
@@ -532,7 +587,7 @@ impl HerdrWindow {
         // choosing the device itself keeps the transport it has, the way choosing
         // it from the picker does.
         if retargeted {
-            self.reconnect();
+            self.reconnect(cx);
         }
         // After the reconnect: resetting the connection clears the error slot.
         if let Some(error) = self.catalog.poll_write() {
@@ -574,7 +629,9 @@ impl HerdrWindow {
         if self.device_filter.is_some() {
             self.device_filter = Some(id.to_owned());
         }
-        self.reset_selected();
+        self.reset_selected(cx);
+        // The picture kept for an outage is the previous endpoint's.
+        self.presentation.clear();
         self.activation_deadline =
             (!self.endpoints[index].detached).then(|| Instant::now() + ACTIVATION_TIMEOUT);
         cx.notify();

@@ -56,13 +56,29 @@ pub(crate) struct Browser {
     pub(super) tab_scroll: super::tab_scroll::TabScroll,
     /// Groups opening from a split and folding away as they close.
     pub(super) group_motion: super::group_motion::GroupMotion,
-    /// Why a tab's page could not be created, shown in its place.
-    pub(super) failed: Option<(TabId, SharedString)>,
+    /// Why each tab's page could not be created, shown in its place. One
+    /// per tab, so a failure elsewhere never clears another's and sets it
+    /// retrying; bounded by the tabs the store keeps.
+    pub(super) failed: HashMap<TabId, SharedString>,
+    /// Whether the VS Code server answers, asked before its pages open.
+    pub(super) code_server: super::code::CodeServer,
     /// The workspaces of the last snapshot and the boot they came from: one
     /// missing from the next snapshot of the same boot was closed.
     workspaces: Option<(Scope, String, HashSet<String>)>,
     #[cfg(any(target_os = "macos", windows))]
     pub(super) annotations: Annotations,
+    /// The menu page open when pages were last presented, which the menu's
+    /// measured cover belongs to.
+    #[cfg(any(target_os = "macos", windows))]
+    pub(super) cover_page: Option<crate::menu::Page>,
+    /// While the pointer is over the status bar, the band above it where
+    /// the bar's tooltips show. Pages draw above tooltips, so those in the
+    /// band step aside, as for a menu.
+    #[cfg(any(target_os = "macos", windows))]
+    pub(super) tooltip_band: Option<Bounds<Pixels>>,
+    /// Where the status bar last drew, which the band sits above.
+    #[cfg(any(target_os = "macos", windows))]
+    pub(super) status_bar: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
 }
 
 impl Browser {
@@ -86,10 +102,17 @@ impl Browser {
             appear: Default::default(),
             tab_scroll: Default::default(),
             group_motion: Default::default(),
-            failed: None,
+            failed: HashMap::new(),
+            code_server: Default::default(),
             workspaces: None,
             #[cfg(any(target_os = "macos", windows))]
             annotations: Annotations::new(cx),
+            #[cfg(any(target_os = "macos", windows))]
+            cover_page: None,
+            #[cfg(any(target_os = "macos", windows))]
+            tooltip_band: None,
+            #[cfg(any(target_os = "macos", windows))]
+            status_bar: Default::default(),
         }
     }
 }
@@ -159,14 +182,7 @@ impl HerdrWindow {
         }
         #[cfg(any(target_os = "macos", windows))]
         self.browser.pages.retain(|id| !gone(id));
-        if self
-            .browser
-            .failed
-            .as_ref()
-            .is_some_and(|(id, _)| gone(*id))
-        {
-            self.browser.failed = None;
-        }
+        self.browser.failed.retain(|id, _| !gone(*id));
         #[cfg(any(target_os = "macos", windows))]
         let annotated: Vec<TabId> = self
             .browser
@@ -280,8 +296,10 @@ impl HerdrWindow {
         }
         self.forget_closed_workspaces(cx);
         self.forget_closed_herdr_tabs(cx);
+        self.ensure_code_page(window, cx);
         self.poll_deliveries(cx);
         self.poll_reviews(cx);
+        self.poll_code_views(cx);
         self.sync_addresses(false, window, cx);
     }
 
@@ -340,8 +358,7 @@ impl HerdrWindow {
     #[cfg(any(target_os = "macos", windows))]
     fn apply_page_events(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use super::native::Event;
-        let events: Vec<Event> = self.browser.pages.drain().collect();
-        for event in events {
+        while let Some(event) = self.browser.pages.next_event() {
             match event {
                 Event::Title(id, title) => {
                     Store::update(cx, |store| store.visited(id, None, Some(&title)));
@@ -363,25 +380,47 @@ impl HerdrWindow {
                 #[cfg(target_os = "macos")]
                 Event::Frozen(id, tiff) => self.page_frozen(id, tiff, cx),
                 Event::NewWindow(id, url) => {
-                    let parent = store(cx).and_then(|store| store.get(id)).cloned();
-                    if let (Some(parent), Ok(url)) = (parent, WebUrl::try_from(url.as_str())) {
-                        // The new tab opens where its opener shows.
-                        let group = self.group_showing(&Pick::Page(id), cx);
-                        let opened = Store::update(cx, |store| {
-                            store.open(
-                                parent.scope,
-                                &parent.workspace_id,
-                                Some(Location::Web { url }),
-                                parent.origin,
-                            )
-                        });
-                        if let Some(opened) = opened {
-                            self.show_browser_tab_in(group, opened, window, cx);
-                        }
+                    if let Ok(url) = WebUrl::try_from(url.as_str())
+                        && let Some(opened) = self.open_beside(id, url, cx)
+                    {
+                        self.show_browser_tab_in(opened.0, opened.1, window, cx);
                     }
                 }
+                #[cfg(target_os = "macos")]
+                Event::Opened(id, url, source, popup) => {
+                    // Without a tab the popup is dropped, and with it the
+                    // opener's link to it.
+                    if let Some((group, opened)) = self.open_beside(id, url, cx) {
+                        self.browser.pages.adopt(opened, source, popup, window, cx);
+                        self.show_browser_tab_in(group, opened, window, cx);
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                Event::Closed(id) => self.close_browser_tab(id, window, cx),
             }
         }
+    }
+
+    /// Opens a tab on `url` for a page of tab `opener`, in its workspace and
+    /// in the group showing it. Returns that group and the new tab.
+    #[cfg(any(target_os = "macos", windows))]
+    fn open_beside(
+        &mut self,
+        opener: TabId,
+        url: WebUrl,
+        cx: &mut Context<Self>,
+    ) -> Option<(Option<GroupId>, TabId)> {
+        let parent = store(cx).and_then(|store| store.get(opener)).cloned()?;
+        let group = self.group_showing(&Pick::Page(opener), cx);
+        let opened = Store::update(cx, |store| {
+            store.open(
+                parent.scope,
+                &parent.workspace_id,
+                Some(Location::Web { url }),
+                parent.origin,
+            )
+        })?;
+        Some((group, opened))
     }
 
     /// Whether a notes panel or a note is still moving, so the window draws

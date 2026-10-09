@@ -1,5 +1,4 @@
-//! Moving the line between a side-by-side diff's halves, and drawing the
-//! diff's syntax colours.
+//! Moving the line between a side-by-side diff's halves.
 use super::{changes, the, window};
 use crate::review::view::Layout;
 use gpui::{Modifiers, MouseButton, MouseDownEvent, point, px};
@@ -11,22 +10,16 @@ fn draw(cx: &mut gpui::VisualTestContext) {
 #[gpui::test]
 fn the_line_between_the_sides_drags_and_resets(cx: &mut gpui::TestAppContext) {
     let (view, cx) = window(cx, None);
-    let mut loaded = changes();
-    crate::review::highlight::colour(&mut loaded.diff);
-    assert!(
-        loaded.diff.rows.iter().any(|row| !row.spans.is_empty()),
-        "coloured"
-    );
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.seed_review(loaded, window, cx);
+            view.seed_review(changes(), window, cx);
             view.set_review_layout(the(view), Layout::Split, cx);
         })
     });
     // The list lays out once before the line knows where to sit.
     draw(cx);
     draw(cx);
-    let left = cx.debug_bounds("review-left-3").unwrap();
+    let left = cx.debug_bounds("review-left-0-2").unwrap();
     let line = cx.debug_bounds("review-split-divider").unwrap();
     assert!(
         (line.center().x - left.right()).abs() <= px(4.),
@@ -45,12 +38,12 @@ fn the_line_between_the_sides_drags_and_resets(cx: &mut gpui::TestAppContext) {
     cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::default());
     cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::default());
     draw(cx);
-    let wider = cx.debug_bounds("review-left-3").unwrap();
+    let wider = cx.debug_bounds("review-left-0-2").unwrap();
     assert!(
         (wider.size.width - left.size.width - px(120.)).abs() <= px(4.),
         "{wider:?}"
     );
-    assert!(cx.debug_bounds("review-right-4").unwrap().left() >= wider.right());
+    assert!(cx.debug_bounds("review-right-0-3").unwrap().left() >= wider.right());
 
     // Either side keeps a fifth of the row.
     let line = cx.debug_bounds("review-split-divider").unwrap();
@@ -90,7 +83,7 @@ fn the_line_between_the_sides_drags_and_resets(cx: &mut gpui::TestAppContext) {
         assert_eq!(view.reviews.values().next().unwrap().split_ratio, 0.5);
     });
     assert!(
-        (cx.debug_bounds("review-left-3").unwrap().size.width - left.size.width).abs() <= px(1.)
+        (cx.debug_bounds("review-left-0-2").unwrap().size.width - left.size.width).abs() <= px(1.)
     );
 
     // Unified, there is no line to drag.

@@ -39,7 +39,7 @@ fn input(directory: &tempfile::TempDir) -> Input {
     let path = directory.path().canonicalize().unwrap();
     Input {
         checkout: Some(path.to_str().unwrap().to_owned()),
-        repo_key: path.join(".git").to_str().unwrap().to_owned(),
+        repo_key: Some(path.join(".git").to_str().unwrap().to_owned()),
         branch: "feature".into(),
     }
 }
@@ -47,22 +47,34 @@ fn input(directory: &tempfile::TempDir) -> Input {
 fn changed(loaded: &Loaded, kind: Kind) -> Vec<&str> {
     loaded
         .diff
-        .rows
+        .files
         .iter()
-        .filter(|row| row.kind == kind)
-        .map(|row| row.text.as_str())
+        .filter_map(FileDiff::lines)
+        .flat_map(|lines| {
+            lines
+                .iter()
+                .filter(move |line| line.kind == kind)
+                .map(|line| lines.text_of(line))
+        })
         .collect()
+}
+
+/// The checkout's changes in `scope`, every file read.
+fn read(directory: &tempfile::TempDir, scope: Scope, hint: Option<&str>) -> crate::Result<Loaded> {
+    let mut loaded = load(&input(directory), scope, hint, false)?;
+    loaded.read_all();
+    Ok(loaded)
 }
 
 #[test]
 fn a_branch_review_includes_its_commits_and_uncommitted_work() {
     let directory = repository("main");
-    let uncommitted = load(&input(&directory), Scope::Uncommitted, None).unwrap();
+    let uncommitted = read(&directory, Scope::Uncommitted, None).unwrap();
     assert_eq!(changed(&uncommitted, Kind::Added), ["four", "fresh"]);
     assert_eq!(uncommitted.base, None);
     assert_eq!(uncommitted.diff.before, "HEAD");
 
-    let branch = load(&input(&directory), Scope::Branch, None).unwrap();
+    let branch = read(&directory, Scope::Branch, None).unwrap();
     assert_eq!(
         changed(&branch, Kind::Added),
         ["two changed", "four", "fresh"]
@@ -76,12 +88,11 @@ fn a_branch_review_includes_its_commits_and_uncommitted_work() {
     );
     // Added lines keep the working tree's numbers in either scope.
     let four = |loaded: &Loaded| {
-        loaded
-            .diff
-            .rows
+        let lines = loaded.diff.files[0].lines()?;
+        lines
             .iter()
-            .find(|row| row.text == "four")
-            .and_then(|row| row.new)
+            .find(|line| lines.text_of(line) == "four")
+            .and_then(|line| line.new)
     };
     assert_eq!(four(&uncommitted), Some(4));
     assert_eq!(four(&branch), Some(4));
@@ -91,22 +102,22 @@ fn a_branch_review_includes_its_commits_and_uncommitted_work() {
 fn the_base_falls_back_from_a_missing_or_unsafe_hint() {
     let directory = repository("master");
     for hint in [Some("release"), Some("--output=/tmp/x"), Some("a..b"), None] {
-        let branch = load(&input(&directory), Scope::Branch, hint).unwrap();
+        let branch = read(&directory, Scope::Branch, hint).unwrap();
         assert_eq!(branch.base.as_deref(), Some("master"), "{hint:?}");
     }
     let directory = repository("trunk");
     assert!(matches!(
-        load(&input(&directory), Scope::Branch, None),
+        read(&directory, Scope::Branch, None),
         Err(crate::Error::ReviewNoBase)
     ));
-    let branch = load(&input(&directory), Scope::Branch, Some("trunk")).unwrap();
+    let branch = read(&directory, Scope::Branch, Some("trunk")).unwrap();
     assert_eq!(branch.base.as_deref(), Some("trunk"));
 }
 
 #[test]
 fn candidates_are_full_refs_in_order_without_repeats() {
     assert_eq!(
-        base_candidates(Some("develop"), Some("refs/remotes/origin/main")),
+        load::base_candidates(Some("develop"), Some("refs/remotes/origin/main")),
         [
             "refs/remotes/origin/develop",
             "refs/heads/develop",
@@ -119,7 +130,7 @@ fn candidates_are_full_refs_in_order_without_repeats() {
     for refused in [
         "", "-x", "/x", ".x", "a..b", "a b", "a~1", "a^", "a:b", "a\\b", "a@{1}",
     ] {
-        assert!(!plain_branch(refused), "{refused}");
+        assert!(!load::plain_branch(refused), "{refused}");
     }
-    assert!(plain_branch("release/2026.10"));
+    assert!(load::plain_branch("release/2026.10"));
 }

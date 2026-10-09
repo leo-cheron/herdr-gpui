@@ -1,5 +1,5 @@
 //! Resizing the review's notes panel by its edge.
-use super::{changes, the, window};
+use super::{changes, line, the, window};
 use gpui::{Modifiers, MouseButton, MouseDownEvent, point, px};
 
 fn draw(cx: &mut gpui::VisualTestContext) {
@@ -131,7 +131,7 @@ fn a_narrow_review_hides_its_panels_until_asked(cx: &mut gpui::TestAppContext) {
     assert!(cx.debug_bounds("review-notes").is_none());
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.begin_review_note(the(view), 4, window, cx)
+            view.begin_review_note(the(view), line(3), window, cx)
         })
     });
     draw(cx);
@@ -165,7 +165,7 @@ fn a_wide_review_shows_its_panels_unless_hidden(cx: &mut gpui::TestAppContext) {
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
             let id = the(view);
-            view.begin_review_note(id, 4, window, cx);
+            view.begin_review_note(id, line(3), window, cx);
             let input = view.reviews[&id].input.clone();
             input.update(cx, |input, cx| input.set_text_selected("Fix", cx));
             view.add_review_note(id, window, cx);

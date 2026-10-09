@@ -113,7 +113,7 @@ fn header_keeps_controls_reachable(cx: &mut TestAppContext) {
             view.git = crate::git::Git::fixture(
                 crate::pull_request::Input {
                     checkout: None,
-                    repo_key: "/fixture/.git".into(),
+                    repo_key: Some("/fixture/.git".into()),
                     branch: "main".into(),
                 },
                 crate::git::Status::default(),
@@ -154,6 +154,7 @@ fn endpoint_status_replaces_and_disconnect_clears() {
     assert_eq!(StatusText::live(&live).text, "Remote usage");
     live.apply(herdr_client::ClientEvent::Disconnected {
         reason: herdr_client::Error::Disconnected.to_string(),
+        ssh: None,
     });
     assert!(StatusText::live(&live).text.is_empty());
 }

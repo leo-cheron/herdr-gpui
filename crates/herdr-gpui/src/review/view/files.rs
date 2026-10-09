@@ -1,122 +1,186 @@
-//! The review's changed files, listed left of the diff as a pull request's
-//! file tree is: grouped under their folders, each with how it changed, its
-//! line counts and the notes queued on it. Clicking one brings its header to
-//! the top of the diff; the file at the top of the diff is marked.
-use super::{Layout, Review};
+//! The review's changed files, left of the diff as a pull request's file
+//! tree is: under folders that fold, each with how it changed, its line
+//! counts, the notes queued on it and whether it was viewed. A filter keeps
+//! the files whose path holds it, and viewed files can be hidden. Clicking a
+//! file, or Enter on the one picked with the arrows, brings its header to the
+//! top of the diff; the file at the top of the diff is marked, and kept in
+//! view as the diff scrolls.
+use super::{Review, tree::Node};
 use crate::browser::TabId;
 use crate::{
     HerdrWindow,
     config::Theme,
     panel_resize::PanelDrag,
-    review::diff::{Anchor, Diff, FileEntry, SplitRow},
+    review::diff::{Anchor, Body, FileDiff, RowId, Status},
 };
 use gpui::{prelude::*, *};
 use std::collections::HashMap;
 
-/// One line of the file list.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum FileItem {
-    /// A folder heading, its path from the checkout's root.
-    Folder(String),
-    /// A file, as an index into the review's file entries.
-    File(usize),
-}
-
-/// The folder part of `path`, or `None` at the checkout's root.
-fn folder(path: &str) -> Option<&str> {
-    path.rsplit_once('/').map(|(folder, _)| folder)
-}
-
-/// Groups `entries` under folder headings, in the diff's order. Git lists
-/// paths sorted, so a folder's files are together; a root file after a folder
-/// gets the root's own heading, so it never reads as part of that folder.
-pub(super) fn file_items(diff: &Diff, entries: &[FileEntry]) -> Vec<FileItem> {
-    let mut items = Vec::with_capacity(entries.len() * 2);
-    let mut current: Option<Option<&str>> = None;
-    for (index, entry) in entries.iter().enumerate() {
-        let path = diff.files.get(entry.file).map_or("", String::as_str);
-        let here = folder(path);
-        if current != Some(here) {
-            match here {
-                Some(folder) => items.push(FileItem::Folder(folder.to_owned())),
-                None if current.is_some() => items.push(FileItem::Folder("/".to_owned())),
-                None => {}
-            }
-            current = Some(here);
-        }
-        items.push(FileItem::File(index));
-    }
-    items
-}
-
 /// The letter a file's change shows as, and its colour.
-fn status(theme: &Theme, status: &str) -> (&'static str, u32) {
-    match status {
-        "new" | "untracked" => ("A", theme.ink(theme.palette[2])),
-        "deleted" => ("D", theme.ink(theme.palette[1])),
-        "renamed" => ("R", theme.ink(theme.palette[4])),
-        "too large to show" => ("!", theme.muted),
-        _ => ("M", theme.ink(theme.palette[3])),
-    }
+fn status(theme: &Theme, status: Status) -> (&'static str, u32) {
+    let colour = match status {
+        Status::Added | Status::Untracked => theme.ink(theme.palette[2]),
+        Status::Deleted => theme.ink(theme.palette[1]),
+        Status::Renamed => theme.ink(theme.palette[4]),
+        Status::Modified => theme.ink(theme.palette[3]),
+    };
+    (status.letter(), colour)
+}
+
+/// A file's counts as the list shows them, zeros left out.
+fn counts(theme: &Theme, entry: &FileDiff) -> Div {
+    let count = |value: Option<u32>, sign: &str, colour: u32| {
+        value.filter(|value| *value > 0).map(|value| {
+            div()
+                .text_color(rgb(colour))
+                .child(format!("{sign}{value}"))
+        })
+    };
+    div()
+        .flex_none()
+        .flex()
+        .gap_1()
+        .text_size(px(11.))
+        .children(count(entry.added, "+", theme.ink(theme.palette[2])))
+        .children(count(
+            entry.removed,
+            "\u{2212}",
+            theme.ink(theme.palette[1]),
+        ))
 }
 
 impl Review {
-    /// The list position of the row at the top of the diff.
-    fn top_row(&self) -> Option<usize> {
-        // Rows are one height, so the scroll offset says which is at the
-        // top: the list's content is its rows end to end.
-        let position = {
-            let state = self.scroll.0.borrow();
-            let rows = self.row_count();
-            let height = f32::from(state.last_item_size?.contents.height) / rows.max(1) as f32;
-            let offset = -f32::from(state.base_handle.offset().y);
-            if height <= 0. {
-                return None;
-            }
-            ((offset.max(0.) / height) as usize).min(rows.saturating_sub(1))
+    /// Works out which lines the file list shows, after the filter, the
+    /// folders or the viewed files changed.
+    pub(super) fn refresh_shown(&mut self) {
+        let query = self.filter_text.to_lowercase();
+        let filtered = !query.is_empty();
+        let Some(loaded) = self.loaded() else {
+            self.shown.clear();
+            return;
         };
-        match self.layout {
-            Layout::Unified => Some(position),
-            Layout::Split => match *self.split.get(position)? {
-                SplitRow::Across(row) => Some(row),
-                SplitRow::Sides { left, right } => left.or(right),
-            },
-        }
+        let files = &loaded.diff.files;
+        let shown = self.tree.shown(&self.closed, filtered, |file| {
+            files.get(file).is_some_and(|entry| {
+                (!filtered || entry.path.to_lowercase().contains(&query))
+                    && !(self.hide_viewed && self.is_viewed(file))
+            })
+        });
+        self.shown = shown;
+        self.picked = self.picked.filter(|picked| *picked < self.shown.len());
     }
 
-    /// The file whose rows are at the top of the diff.
-    pub(super) fn top_file(&self) -> Option<usize> {
-        let loaded = self.loaded()?;
-        let row = self.top_row()?;
-        loaded.diff.rows.get(row).map(|row| row.file)
-    }
-
-    /// Where the header of file entry `index` sits in the list as drawn.
-    fn header_position(&self, index: usize) -> Option<usize> {
-        let header = self.files.get(index)?.header;
-        match self.layout {
-            Layout::Unified => Some(header),
-            Layout::Split => self
-                .split
-                .iter()
-                .position(|row| *row == SplitRow::Across(header)),
+    /// The file on line `line` of the list, if a file is there.
+    fn file_at(&self, line: usize) -> Option<usize> {
+        match self.tree.nodes.get(*self.shown.get(line)?)? {
+            Node::File { file, .. } => Some(*file),
+            Node::Folder { .. } => None,
         }
     }
 }
 
 impl HerdrWindow {
-    /// Brings file entry `index`'s header to the top of the diff.
-    pub(super) fn jump_to_review_file(&mut self, id: TabId, index: usize, cx: &mut Context<Self>) {
-        let Some(review) = self.reviews.get(&id) else {
-            return;
-        };
-        // Strict: a header already in view still moves to the top.
-        if let Some(position) = review.header_position(index) {
-            review
-                .scroll
-                .scroll_to_item_strict(position, ScrollStrategy::Top);
+    /// Brings `file`'s header to the top of the diff.
+    pub(super) fn jump_to_review_file(&mut self, id: TabId, file: usize, cx: &mut Context<Self>) {
+        if let Some(review) = self.reviews.get_mut(&id) {
+            review.scroll_to_row(RowId::Header(file));
+            // The list follows the diff: the file it jumped to is current.
+            review.revealed.set(Some(file));
         }
         cx.notify();
+    }
+
+    /// Opens or closes the folder at `node` of the tree.
+    fn toggle_review_folder(&mut self, id: TabId, node: usize, cx: &mut Context<Self>) {
+        if let Some(review) = self.reviews.get_mut(&id)
+            && let Some(Node::Folder { path, .. }) = review.tree.nodes.get(node)
+        {
+            let path = path.clone();
+            if !review.closed.remove(&path) {
+                review.closed.insert(path);
+            }
+            review.refresh_shown();
+        }
+        cx.notify();
+    }
+
+    /// Follows the filter's text as it is typed.
+    pub(super) fn review_filter_changed(&mut self, id: TabId, cx: &mut Context<Self>) {
+        if let Some(review) = self.reviews.get_mut(&id) {
+            review.filter_text = review.filter.read(cx).text().to_owned();
+            review.refresh_shown();
+            review.picked = (!review.shown.is_empty()).then_some(0);
+        }
+        cx.notify();
+    }
+
+    /// Arrows pick a line of the list, Enter shows it, Left and Right close
+    /// and open a folder; whether the key was the list's. While the filter
+    /// is typed in, Left and Right stay the filter's.
+    fn review_files_key(
+        &mut self,
+        id: TabId,
+        key: &str,
+        filtering: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(review) = self.reviews.get_mut(&id) else {
+            return false;
+        };
+        let count = review.shown.len();
+        if count == 0 {
+            return false;
+        }
+        let picked = review.picked;
+        let folder = picked
+            .and_then(|line| review.shown.get(line).copied())
+            .and_then(|node| match review.tree.nodes.get(node)? {
+                Node::Folder { path, .. } => Some((node, review.closed.contains(path))),
+                Node::File { .. } => None,
+            });
+        match key {
+            "down" => review.picked = Some(picked.map_or(0, |line| (line + 1).min(count - 1))),
+            "up" => review.picked = Some(picked.map_or(0, |line| line.saturating_sub(1))),
+            "enter" => {
+                if let Some(file) = picked.and_then(|line| review.file_at(line)) {
+                    self.jump_to_review_file(id, file, cx);
+                } else if let Some((node, _)) = folder {
+                    self.toggle_review_folder(id, node, cx);
+                }
+                return true;
+            }
+            "left" | "right" if !filtering => {
+                if let Some((node, closed)) = folder
+                    && closed == (key == "right")
+                {
+                    self.toggle_review_folder(id, node, cx);
+                }
+                return true;
+            }
+            _ => return false,
+        }
+        if let Some(line) = review.picked {
+            review
+                .files_scroll
+                .scroll_to_item(line, ScrollStrategy::Nearest);
+        }
+        cx.notify();
+        true
+    }
+
+    /// Picks line `line` of the list, which then takes the arrows.
+    fn pick_review_file(
+        &mut self,
+        id: TabId,
+        line: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(review) = self.reviews.get_mut(&id) {
+            review.picked = Some(line);
+            let focus = review.files_focus.clone();
+            window.focus(&focus, cx);
+        }
     }
 
     /// The file list, resizable by its right edge.
@@ -128,27 +192,101 @@ impl HerdrWindow {
     ) -> Stateful<Div> {
         let theme = &self.theme;
         let line_height = self.config.ui.line_height() + 8.;
-        let count = review.file_items.len();
-        let files = review.files.len();
+        let count = review.shown.len();
+        let files = review.loaded().map_or(0, |loaded| loaded.diff.files.len());
+        // Keeps the file at the top of the diff in view in the list.
+        let current = review.top_file();
+        if current.is_some() && review.revealed.get() != current {
+            review.revealed.set(current);
+            let line = review.shown.iter().position(|&node| {
+                matches!(review.tree.nodes.get(node), Some(Node::File { file, .. }) if Some(*file) == current)
+            });
+            if let Some(line) = line {
+                review
+                    .files_scroll
+                    .scroll_to_item(line, ScrollStrategy::Nearest);
+            }
+        }
+        let hide = div()
+            .id("review-hide-viewed")
+            .debug_selector(|| "review-hide-viewed".into())
+            .flex_none()
+            .px_1()
+            .rounded(px(crate::config::corners::CONTROL))
+            .cursor_pointer()
+            .text_color(rgb(if review.hide_viewed {
+                theme.foreground
+            } else {
+                theme.muted
+            }))
+            .when(review.hide_viewed, |button| button.bg(rgb(theme.active)))
+            .hover(|button| button.bg(rgb(theme.active)))
+            .child("Hide viewed")
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(review) = this.reviews.get_mut(&id) {
+                    review.hide_viewed = !review.hide_viewed;
+                    review.refresh_shown();
+                }
+                cx.notify();
+            }));
         let panel = div()
             .id("review-files")
             .debug_selector(|| "review-files".into())
+            .track_focus(&review.files_focus)
             .flex_none()
             .h_full()
             .flex()
             .flex_col()
             .border_r_1()
             .border_color(rgb(theme.active))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                let Some(filter) = this.reviews.get(&id).map(|review| review.filter.read(cx))
+                else {
+                    return;
+                };
+                let (composing, filtering) =
+                    (filter.is_composing(), filter.focus.is_focused(window));
+                let key = event.keystroke.key.as_str();
+                if !composing && this.review_files_key(id, key, filtering, cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .child(
                 div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
                     .px_2()
                     .py_1()
                     .text_color(rgb(theme.muted))
-                    .child(if files == 1 {
+                    .child(div().flex_1().min_w_0().truncate().child(if files == 1 {
                         "1 file changed".to_owned()
                     } else {
                         format!("{files} files changed")
-                    }),
+                    }))
+                    .child(hide),
+            )
+            .child(
+                div()
+                    .id("review-filter")
+                    .debug_selector(|| "review-filter".into())
+                    .mx_2()
+                    .mb_1()
+                    .px_1()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .rounded(px(crate::config::corners::CONTROL))
+                    .border_1()
+                    .border_color(rgb(theme.active))
+                    .child(
+                        svg()
+                            .path("icons/search.svg")
+                            .flex_none()
+                            .size(px(12.))
+                            .text_color(rgb(theme.muted)),
+                    )
+                    .child(div().flex_1().min_w_0().child(review.filter.clone())),
             )
             .child(
                 uniform_list(
@@ -182,10 +320,9 @@ impl HerdrWindow {
         let Some(review) = self.reviews.get(&id) else {
             return Vec::new();
         };
-        let Some(loaded) = review.loaded().cloned() else {
+        let Some(loaded) = review.loaded() else {
             return Vec::new();
         };
-        let diff = &loaded.diff;
         let current = review.top_file();
         let mut notes: HashMap<&str, usize> = HashMap::new();
         for note in &review.notes {
@@ -193,37 +330,68 @@ impl HerdrWindow {
             *notes.entry(path.as_str()).or_default() += 1;
         }
         range
-            .filter_map(|position| {
+            .filter_map(|line| {
+                let node_index = *review.shown.get(line)?;
+                let node = review.tree.nodes.get(node_index)?;
                 // Each line spans the list, so the current file's band does.
                 let row = div()
                     .w_full()
                     .h(px(line_height))
-                    .px_2()
+                    .pr_2()
+                    .pl(px(8. + 12. * node.depth() as f32))
                     .flex()
                     .items_center()
                     .gap_1()
                     .whitespace_nowrap()
-                    .overflow_hidden();
-                Some(match review.file_items.get(position)? {
-                    FileItem::Folder(folder) => row
-                        .text_color(rgb(theme.muted))
-                        .child(div().min_w_0().truncate().child(folder.clone()))
-                        .into_any_element(),
-                    FileItem::File(index) => {
-                        let index = *index;
-                        let entry = review.files.get(index)?;
-                        let path = diff.files.get(entry.file)?;
-                        let name = path.rsplit('/').next().unwrap_or(path).to_owned();
-                        let (letter, colour) = status(theme, &entry.status);
-                        let noted = notes.get(path.as_str()).copied().unwrap_or(0);
-                        let skipped = entry.status == "too large to show";
-                        row.id(("review-file", index))
-                            .debug_selector(move || format!("review-file-{index}"))
-                            .pl(px(if folder(path).is_some() { 18. } else { 8. }))
-                            .cursor_pointer()
-                            .rounded(px(crate::config::corners::CONTROL))
-                            .when(current == Some(entry.file), |row| row.bg(rgb(theme.active)))
-                            .hover(|row| row.bg(rgb(theme.active)))
+                    .overflow_hidden()
+                    .cursor_pointer()
+                    .rounded(px(crate::config::corners::CONTROL))
+                    .when(review.picked == Some(line), |row| {
+                        row.border_1().border_color(rgb(theme.muted))
+                    })
+                    .hover(|row| row.bg(rgb(theme.active)));
+                Some(match node {
+                    Node::Folder { path, label, .. } => {
+                        let closed = review.closed.contains(path);
+                        row.id(("review-folder", node_index))
+                            .debug_selector(move || format!("review-folder-{node_index}"))
+                            .text_color(rgb(theme.muted))
+                            .child(
+                                svg()
+                                    .path(if closed {
+                                        "icons/chevron-right.svg"
+                                    } else {
+                                        "icons/chevron-down.svg"
+                                    })
+                                    .flex_none()
+                                    .size(px(10.))
+                                    .text_color(rgb(theme.muted)),
+                            )
+                            .child(div().min_w_0().truncate().child(label.clone()))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.pick_review_file(id, line, window, cx);
+                                this.toggle_review_folder(id, node_index, cx);
+                            }))
+                            .into_any_element()
+                    }
+                    Node::File { file, .. } => {
+                        let file = *file;
+                        let entry = loaded.diff.files.get(file)?;
+                        let name = entry
+                            .path
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(&entry.path)
+                            .to_owned();
+                        let (letter, colour) = status(theme, entry.status);
+                        let noted = notes.get(entry.path.as_str()).copied().unwrap_or(0);
+                        let viewed = review.is_viewed(file);
+                        let dim = viewed || entry.body == Body::Binary;
+                        row.id(("review-file", file))
+                            .debug_selector(move || format!("review-file-{file}"))
+                            .when(current == Some(file), |row| row.bg(rgb(theme.active)))
+                            .text_color(rgb(if dim { theme.muted } else { theme.foreground }))
                             .child(
                                 div()
                                     .flex_none()
@@ -244,32 +412,20 @@ impl HerdrWindow {
                                         .child(noted.to_string()),
                                 )
                             })
-                            .when(!skipped, |row| {
+                            .when(viewed, |row| {
                                 row.child(
-                                    div()
+                                    svg()
+                                        .path("icons/check.svg")
                                         .flex_none()
-                                        .flex()
-                                        .gap_1()
-                                        .text_size(px(11.))
-                                        .when(entry.added > 0, |counts| {
-                                            counts.child(
-                                                div()
-                                                    .text_color(rgb(theme.ink(theme.palette[2])))
-                                                    .child(format!("+{}", entry.added)),
-                                            )
-                                        })
-                                        .when(entry.removed > 0, |counts| {
-                                            counts.child(
-                                                div()
-                                                    .text_color(rgb(theme.ink(theme.palette[1])))
-                                                    .child(format!("\u{2212}{}", entry.removed)),
-                                            )
-                                        }),
+                                        .size(px(10.))
+                                        .text_color(rgb(theme.muted)),
                                 )
                             })
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .child(counts(theme, entry))
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
-                                this.jump_to_review_file(id, index, cx);
+                                this.pick_review_file(id, line, window, cx);
+                                this.jump_to_review_file(id, file, cx);
                             }))
                             .into_any_element()
                     }

@@ -6,6 +6,10 @@ pub enum Command {
     NewWindow,
     Workspace,
     NewWorktree,
+    /// Go To, listing only the checkouts that have a note.
+    WorktreeNotes,
+    /// The focused checkout's note.
+    EditWorktreeNote,
     Tab,
     SplitRight,
     SplitDown,
@@ -20,12 +24,15 @@ pub enum Command {
     Zoom,
     ClearPane,
     Find,
+    FindNext,
+    FindPrevious,
     CopyMode,
     EditScrollback,
     ClosePane,
     CloseTab,
     TabNumber(u8),
     ToggleSidebar,
+    ToggleStatusBar,
     IncreaseFontSize,
     DecreaseFontSize,
     ResetFontSize,
@@ -35,6 +42,10 @@ pub enum Command {
     Themes,
     WorkspacePicker,
     Palette,
+    /// Go to a definition in the focused pane's checkout.
+    GoToSymbol,
+    /// Go to a file in the focused pane's checkout.
+    GoToFile,
     Reconnect,
     Quit,
     Logs,
@@ -43,6 +54,11 @@ pub enum Command {
     NewBrowserTab,
     InstallBrowserSkill,
     SplitEditor,
+    ToggleCode,
+    MoveCodeToGroup,
+    MoveCodeToPanel,
+    ToggleFullScreen,
+    CycleWindows,
     MoveTabPrevious,
     MoveTabNext,
     RenameTab,
@@ -107,6 +123,18 @@ pub const COMMANDS: &[CommandInfo] = &[
         name: "new_worktree",
         label: "New Worktree",
         shortcuts: &["cmd-n"],
+    },
+    CommandInfo {
+        command: Command::WorktreeNotes,
+        name: "worktree_notes",
+        label: "Worktree Notes",
+        shortcuts: &[],
+    },
+    CommandInfo {
+        command: Command::EditWorktreeNote,
+        name: "edit_worktree_note",
+        label: "Edit Worktree Note",
+        shortcuts: &[],
     },
     CommandInfo {
         command: Command::PreviousWorkspace,
@@ -355,6 +383,18 @@ pub const COMMANDS: &[CommandInfo] = &[
         shortcuts: &["cmd-f"],
     },
     CommandInfo {
+        command: Command::FindNext,
+        name: "find_next",
+        label: "Find Next",
+        shortcuts: &["cmd-g"],
+    },
+    CommandInfo {
+        command: Command::FindPrevious,
+        name: "find_previous",
+        label: "Find Previous",
+        shortcuts: &["cmd-shift-g"],
+    },
+    CommandInfo {
         command: Command::CopyMode,
         name: "copy_mode",
         label: "Copy Mode",
@@ -505,6 +545,12 @@ pub const COMMANDS: &[CommandInfo] = &[
         shortcuts: &["cmd-b"],
     },
     CommandInfo {
+        command: Command::ToggleStatusBar,
+        name: "toggle_status_bar",
+        label: "Toggle Status Bar",
+        shortcuts: &[],
+    },
+    CommandInfo {
         command: Command::IncreaseFontSize,
         name: "increase_font_size",
         label: "Increase Font Size",
@@ -565,6 +611,18 @@ pub const COMMANDS: &[CommandInfo] = &[
         shortcuts: &["cmd-shift-p"],
     },
     CommandInfo {
+        command: Command::GoToSymbol,
+        name: "go_to_symbol",
+        label: "Go to Symbol",
+        shortcuts: &["cmd-shift-o"],
+    },
+    CommandInfo {
+        command: Command::GoToFile,
+        name: "go_to_file",
+        label: "Go to File",
+        shortcuts: &["cmd-o"],
+    },
+    CommandInfo {
         command: Command::Reconnect,
         name: "reconnect",
         label: "Reconnect",
@@ -586,7 +644,7 @@ pub const COMMANDS: &[CommandInfo] = &[
         command: Command::NewBrowserTab,
         name: "new_browser_tab",
         label: "New Browser Tab",
-        shortcuts: &[],
+        shortcuts: &["cmd-shift-b"],
     },
     CommandInfo {
         command: Command::InstallBrowserSkill,
@@ -599,6 +657,36 @@ pub const COMMANDS: &[CommandInfo] = &[
         name: "split_editor",
         label: "Split Editor",
         shortcuts: &["cmd-\\"],
+    },
+    CommandInfo {
+        command: Command::ToggleCode,
+        name: "toggle_code",
+        label: "Toggle VS Code",
+        shortcuts: &[],
+    },
+    CommandInfo {
+        command: Command::MoveCodeToGroup,
+        name: "move_code_to_group",
+        label: "Move VS Code to Group",
+        shortcuts: &[],
+    },
+    CommandInfo {
+        command: Command::MoveCodeToPanel,
+        name: "move_code_to_panel",
+        label: "Move VS Code to Panel",
+        shortcuts: &[],
+    },
+    CommandInfo {
+        command: Command::ToggleFullScreen,
+        name: "toggle_full_screen",
+        label: "Toggle Full Screen",
+        shortcuts: &["ctrl-cmd-f"],
+    },
+    CommandInfo {
+        command: Command::CycleWindows,
+        name: "cycle_windows",
+        label: "Cycle Through Windows",
+        shortcuts: &["cmd-`"],
     },
 ];
 
@@ -725,18 +813,27 @@ pub fn request(command: Command, snapshot: &ClientShellSnapshot) -> Option<(Meth
         ),
         Command::ClosePane => (Method::PaneClose, json!({"pane_id": pane?.pane_id})),
         Command::CloseTab => (Method::TabClose, json!({"tab_id": tab?.tab_id})),
+        // By position, as Herdr's `switch_tab` does: a tab's `number` is an
+        // ID that is never reused, so it drifts from the strip once a tab closes.
         Command::TabNumber(number) => {
             let workspace = workspace?;
-            let target = snapshot.tabs.iter().find(|t| {
-                t.workspace_id == workspace.workspace_id && t.number == usize::from(number)
-            })?;
+            let target = snapshot
+                .tabs
+                .iter()
+                .filter(|t| t.workspace_id == workspace.workspace_id)
+                .nth(usize::from(number).checked_sub(1)?)?;
             (Method::TabFocus, json!({"tab_id": target.tab_id}))
         }
         Command::NewWindow
         | Command::NewWorktree
+        | Command::WorktreeNotes
+        | Command::EditWorktreeNote
         | Command::Find
+        | Command::FindNext
+        | Command::FindPrevious
         | Command::CopyMode
         | Command::ToggleSidebar
+        | Command::ToggleStatusBar
         | Command::IncreaseFontSize
         | Command::DecreaseFontSize
         | Command::ResetFontSize
@@ -746,6 +843,8 @@ pub fn request(command: Command, snapshot: &ClientShellSnapshot) -> Option<(Meth
         | Command::Themes
         | Command::WorkspacePicker
         | Command::Palette
+        | Command::GoToSymbol
+        | Command::GoToFile
         | Command::Reconnect
         | Command::Quit
         | Command::Logs
@@ -754,6 +853,11 @@ pub fn request(command: Command, snapshot: &ClientShellSnapshot) -> Option<(Meth
         | Command::NewBrowserTab
         | Command::InstallBrowserSkill
         | Command::SplitEditor
+        | Command::ToggleCode
+        | Command::MoveCodeToGroup
+        | Command::MoveCodeToPanel
+        | Command::ToggleFullScreen
+        | Command::CycleWindows
         // These need state beyond the snapshot, such as the sidebar's order
         // or a dialog, so the window runs them.
         | Command::RenameTab

@@ -36,24 +36,40 @@ impl HerdrWindow {
 
     /// Reloads when the GUI overrides change, or the daemon's config whose
     /// `[keys]`, clipboard toast, and `[ui.sidebar]` rows the GUI also honors.
+    /// Reads the theme again when a theme file changes in place.
     pub(crate) fn watch_gui_config(&mut self, cx: &mut Context<Self>) {
         let Ok(path) = Config::local_path() else {
             return;
         };
         let daemon = crate::config::daemon_config_path(|key| std::env::var_os(key));
         let executor = cx.background_executor().clone();
+        let mut theme = self.config.theme.clone();
         self.config_watch = Some(cx.spawn(async move |this, cx| {
             let mut watch = crate::config::watch::Watch::default();
+            let mut theme_watch = crate::config::watch::ThemeWatch::default();
             let mut pending = None;
             loop {
                 let (path, daemon) = (path.clone(), daemon.clone());
-                let sample = executor
+                let (sample, theme_sample, sampled) = executor
                     .spawn(async move {
-                        use crate::config::watch::fingerprint;
-                        [fingerprint(&path), fingerprint(&daemon)]
+                        use crate::config::watch::{fingerprint, fingerprint_all};
+                        let theme_sample = fingerprint_all(Config::theme_files(&theme));
+                        (
+                            [fingerprint(&path), fingerprint(&daemon)],
+                            theme_sample,
+                            theme,
+                        )
                     })
                     .await;
+                theme = sampled;
                 let updated = this.update(cx, |this, cx| {
+                    if theme_watch.observe(&theme, theme_sample, &this.config.theme)
+                        && this.config_load.is_none()
+                        && this.reload_theme(cx)
+                    {
+                        theme_watch.accept(theme_sample);
+                    }
+                    theme.clone_from(&this.config.theme);
                     if let Some((sample, revision)) = pending
                         && this.config_load_revision != revision
                     {
@@ -216,11 +232,15 @@ impl HerdrWindow {
                                 endpoint.toasts.enabled_since = Some(cutoff);
                             }
                         }
+                        if config.status_bar.show != this.config.status_bar.show {
+                            this.status_bar_visible = config.status_bar.show;
+                        }
                         this.config = config.clone();
                         if this.config.theme != "Follow Herdr" {
                             this.theme = theme;
                         }
                         this.apply_shared_theme(cx);
+                        this.theme_light = light;
                         if light != crate::app::light_appearance(cx) {
                             this.apply_system_theme(cx);
                         }
@@ -325,12 +345,15 @@ impl HerdrWindow {
             let group = match info.command {
                 Command::Workspace
                 | Command::NewWorktree
+                | Command::EditWorktreeNote
                 | Command::Tab
                 | Command::SplitRight
                 | Command::SplitDown
                 | Command::Zoom
                 | Command::ClearPane
                 | Command::Find
+                | Command::FindNext
+                | Command::FindPrevious
                 | Command::CopyMode
                 | Command::EditScrollback
                 | Command::ClosePane
@@ -362,6 +385,9 @@ impl HerdrWindow {
                 | Command::PreviousPane
                 | Command::TabNumber(_)
                 | Command::WorkspacePicker
+                | Command::GoToSymbol
+                | Command::GoToFile
+                | Command::WorktreeNotes
                 | Command::LastPane
                 | Command::PreviousWorkspace
                 | Command::NextWorkspace
@@ -371,6 +397,10 @@ impl HerdrWindow {
                 | Command::AgentNumber(_) => 1,
                 Command::NewWindow
                 | Command::ToggleSidebar
+                | Command::ToggleCode
+                | Command::MoveCodeToGroup
+                | Command::MoveCodeToPanel
+                | Command::ToggleStatusBar
                 | Command::IncreaseFontSize
                 | Command::DecreaseFontSize
                 | Command::ResetFontSize
@@ -384,6 +414,8 @@ impl HerdrWindow {
                 | Command::Logs
                 | Command::About
                 | Command::InstallBrowserSkill
+                | Command::ToggleFullScreen
+                | Command::CycleWindows
                 | Command::ReloadConfig => 2,
                 Command::OpenNotificationTarget => 1,
             };

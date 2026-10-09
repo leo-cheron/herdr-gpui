@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 mod processes;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[derive(Clone)]
 struct Target {
@@ -322,15 +322,14 @@ impl HerdrWindow {
                 cx.notify();
             }
             Action::Close => {
-                self.menu.close = self
+                // Keep the original endpoint fence, rather than reopening the menu.
+                if let Some(close) = self
                     .live
                     .snapshot
                     .as_ref()
-                    .and_then(|s| CloseConfirmation::capture_pane(s, &target.pane));
-                if self.menu.close.is_some() {
-                    // Keep the original endpoint fence, rather than reopening the menu.
-                    self.menu.page = Some(Page::ConfirmClose);
-                    cx.notify();
+                    .and_then(|s| CloseConfirmation::capture_pane(s, &target.pane))
+                {
+                    self.present_close(close, window, cx);
                 }
             }
             Action::Processes => self.open_pane_processes(cx),
@@ -574,7 +573,15 @@ impl HerdrWindow {
                             row.bg(rgb(self.theme.active))
                         })
                         .hover(|row| row.bg(rgb(self.theme.active)))
-                        .child(action.label(&pane.target))
+                        .child(
+                            // One line: the panel widens to fit it, and a
+                            // window too narrow for that ends it with "…".
+                            div()
+                                .debug_selector(move || format!("pane-menu-label-{index}"))
+                                .min_w_0()
+                                .truncate()
+                                .child(action.label(&pane.target)),
+                        )
                         .on_hover(cx.listener(move |this, hovered, _, cx| {
                             if *hovered && let Some(pane) = &mut this.menu.pane {
                                 pane.selected = Some(index);
@@ -637,7 +644,9 @@ impl HerdrWindow {
                     );
         }
         body.when_some(pane.error.clone(), |body, error| {
-            body.child(div().p(px(8.)).child(error))
+            // No width of its own, so the labels set the panel's width and
+            // the message wraps inside it.
+            body.child(div().w_0().min_w_full().p(px(8.)).child(error))
         })
     }
 }

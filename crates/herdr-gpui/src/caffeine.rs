@@ -1,134 +1,171 @@
-//! Keeps the display awake on request, like the Caffeine menu-bar app.
+//! Keeps the display and the machine awake on request, like the Caffeine
+//! menu-bar app.
 //!
-//! The assertion belongs to a `caffeinate` child rather than to IOKit calls
-//! made here, so no `unsafe` is needed. `-w` ties the child to this process:
-//! a crash or quit releases the display without any cleanup on our side. The
-//! state is app-wide, so every window's status bar shows the same cup.
+//! The hold is a `keepawake` guard: IOKit power assertions on macOS, the
+//! thread execution state on Windows, and ScreenSaver plus logind inhibitors
+//! over D-Bus on Linux. The unsafe FFI stays inside that crate. Each platform
+//! drops the hold when the process exits, so a crash or quit releases it
+//! without cleanup here. The state is app-wide, so every window's status bar
+//! shows the same cup.
+//!
+//! One dedicated thread owns the guard. Windows ties the execution state to
+//! the thread that set it and restores it on drop from that same thread, and
+//! Linux makes blocking D-Bus calls that must stay off the UI thread.
 
-use crate::Result;
+use crate::{Error, Result};
 use gpui::{App, Global};
-use std::process::Child;
+use std::sync::mpsc::{Receiver, SyncSender};
 
-/// Only macOS ships `caffeinate`; other platforms do not show the toggle.
-pub(crate) const SUPPORTED: bool = cfg!(target_os = "macos");
+/// What the status bar draws for the cup.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Cup {
+    #[default]
+    Off,
+    /// A hold or release is in flight; clicks wait for it.
+    Pending,
+    On,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Command {
+    Hold,
+    Release,
+}
+
+struct Request {
+    command: Command,
+    reply: SyncSender<keepawake::Result<()>>,
+}
 
 #[derive(Default)]
 struct Caffeine {
-    child: Option<Child>,
+    cup: Cup,
+    /// Dropping it ends the worker, which releases any hold on its own thread.
+    worker: Option<SyncSender<Request>>,
 }
 
 impl Global for Caffeine {}
 
-impl Caffeine {
-    /// Forgets a child that exited on its own, e.g. killed from a terminal,
-    /// so the cup never claims an assertion nobody holds.
-    fn reap(&mut self) {
-        if self
-            .child
-            .as_mut()
-            .is_some_and(|child| !matches!(child.try_wait(), Ok(None)))
-        {
-            self.child = None;
-        }
-    }
-}
-
-pub(crate) fn active(cx: &App) -> bool {
+pub(crate) fn cup(cx: &App) -> Cup {
     cx.try_global::<Caffeine>()
-        .is_some_and(|caffeine| caffeine.child.is_some())
+        .map_or(Cup::Off, |caffeine| caffeine.cup)
 }
 
 /// Starts or stops keeping the display awake, and redraws every window.
-pub(crate) fn toggle(cx: &mut App) -> Result<()> {
-    toggle_with(cx, spawn)
+/// Failures arrive later through `report`, never during this call.
+pub(crate) fn toggle(cx: &mut App, report: impl FnOnce(Error, &mut App) + 'static) {
+    toggle_with(cx, hold, report);
 }
 
-fn toggle_with(cx: &mut App, start: impl FnOnce() -> std::io::Result<Child>) -> Result<()> {
+/// `start` makes the hold on the worker thread; it is used only when that
+/// thread is first spawned, so tests can stand in for the real power APIs.
+fn toggle_with<G>(
+    cx: &mut App,
+    start: impl FnMut() -> keepawake::Result<G> + Send + 'static,
+    report: impl FnOnce(Error, &mut App) + 'static,
+) {
     let caffeine = cx.default_global::<Caffeine>();
-    caffeine.reap();
-    if let Some(mut child) = caffeine.child.take() {
-        // Killing never blocks; reaping the zombie does, so it waits elsewhere.
-        let _ = child.kill();
-        cx.background_executor()
-            .spawn(async move {
-                let _ = child.wait();
-            })
-            .detach();
-    } else {
-        caffeine.child = Some(start().map_err(crate::Error::Caffeine)?);
+    let command = match caffeine.cup {
+        Cup::Pending => return,
+        Cup::Off => Command::Hold,
+        Cup::On => Command::Release,
+    };
+    let (reply, replies) = std::sync::mpsc::sync_channel(1);
+    let sent = match caffeine.worker.take() {
+        Some(worker) => Ok(worker),
+        None => spawn(start),
+    }
+    .and_then(|worker| {
+        // Never blocks: `Pending` keeps at most one request in the slot.
+        worker
+            .send(Request { command, reply })
+            .map(|()| worker)
+            .map_err(|_| Error::CaffeineWorkerStopped)
+    });
+    match sent {
+        Ok(worker) => caffeine.worker = Some(worker),
+        Err(error) => {
+            cx.defer(move |cx| report(error, cx));
+            return;
+        }
+    }
+    caffeine.cup = Cup::Pending;
+    cx.refresh_windows();
+    let wait = cx
+        .background_executor()
+        .spawn(async move { replies.recv() });
+    cx.spawn(async move |cx| {
+        // A dropped reply means the worker died, e.g. a panicking release.
+        let result = match wait.await {
+            Ok(result) => result.map_err(Error::Caffeine),
+            Err(_) => Err(Error::CaffeineWorkerStopped),
+        };
+        cx.update(|cx| finish(cx, command, result, report));
+    })
+    .detach();
+}
+
+fn finish(
+    cx: &mut App,
+    command: Command,
+    result: Result<()>,
+    report: impl FnOnce(Error, &mut App),
+) {
+    let caffeine = cx.default_global::<Caffeine>();
+    caffeine.cup = match (command, &result) {
+        (Command::Hold, Ok(())) => Cup::On,
+        // A failed hold holds nothing, and a worker that died mid-release
+        // took its guard with it.
+        (Command::Hold, Err(_)) | (Command::Release, _) => Cup::Off,
+    };
+    if matches!(result, Err(Error::CaffeineWorkerStopped)) {
+        caffeine.worker = None;
     }
     cx.refresh_windows();
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn spawn() -> std::io::Result<Child> {
-    use std::process::{Command, Stdio};
-    // -d holds off display sleep and the screensaver; -i keeps the Mac awake
-    // so agents keep running behind it.
-    Command::new("/usr/bin/caffeinate")
-        .args(["-d", "-i", "-w"])
-        .arg(std::process::id().to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-}
-
-#[cfg(not(target_os = "macos"))]
-fn spawn() -> std::io::Result<Child> {
-    Err(std::io::ErrorKind::Unsupported.into())
-}
-
-#[cfg(all(test, unix))]
-mod tests {
-    #![allow(clippy::unwrap_used)]
-    use super::*;
-    use std::process::Command;
-
-    fn sleeper() -> std::io::Result<Child> {
-        Command::new("sleep").arg("30").spawn()
-    }
-
-    #[gpui::test]
-    fn toggles_on_and_off_and_kills_the_child(cx: &mut gpui::TestAppContext) {
-        assert!(!cx.update(|cx| active(cx)));
-        cx.update(|cx| toggle_with(cx, sleeper)).unwrap();
-        assert!(cx.update(|cx| active(cx)));
-        let pid = cx.read_global::<Caffeine, _>(|c, _| c.child.as_ref().unwrap().id());
-        cx.update(|cx| toggle_with(cx, || unreachable!())).unwrap();
-        assert!(!cx.update(|cx| active(cx)));
-        cx.run_until_parked();
-        // The background reap means the pid no longer names our child.
-        let alive = Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .status()
-            .unwrap();
-        assert!(!alive.success());
-    }
-
-    #[gpui::test]
-    fn failed_start_stays_off_and_keeps_its_source(cx: &mut gpui::TestAppContext) {
-        let error = cx
-            .update(|cx| toggle_with(cx, || Err(std::io::ErrorKind::NotFound.into())))
-            .unwrap_err();
-        assert!(
-            matches!(&error, crate::Error::Caffeine(source) if source.kind() == std::io::ErrorKind::NotFound)
-        );
-        assert!(!cx.update(|cx| active(cx)));
-    }
-
-    #[gpui::test]
-    fn a_child_that_exited_on_its_own_counts_as_off(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| toggle_with(cx, || Command::new("true").spawn()))
-            .unwrap();
-        let mut child = cx.update(|cx| cx.global_mut::<Caffeine>().child.take().unwrap());
-        child.wait().unwrap();
-        cx.update(|cx| cx.global_mut::<Caffeine>().child = Some(child));
-        // The next click starts a fresh assertion instead of "stopping" a dead one.
-        cx.update(|cx| toggle_with(cx, sleeper)).unwrap();
-        assert!(cx.update(|cx| active(cx)));
-        cx.update(|cx| toggle_with(cx, || unreachable!())).unwrap();
-        cx.run_until_parked();
+    if let Err(error) = result {
+        report(error, cx);
     }
 }
+
+fn spawn<G>(
+    start: impl FnMut() -> keepawake::Result<G> + Send + 'static,
+) -> Result<SyncSender<Request>> {
+    let (worker, requests) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("herdr-keepawake".into())
+        .spawn(move || run(&requests, start))
+        .map_err(Error::CaffeineThread)?;
+    Ok(worker)
+}
+
+/// Serves requests until the app drops its sender, then drops any hold here.
+fn run<G>(requests: &Receiver<Request>, mut start: impl FnMut() -> keepawake::Result<G>) {
+    let mut guard = None;
+    for Request { command, reply } in requests {
+        let result = match command {
+            Command::Hold if guard.is_some() => Ok(()),
+            Command::Hold => start().map(|held| guard = Some(held)),
+            Command::Release => {
+                guard = None;
+                Ok(())
+            }
+        };
+        // The waiting task outlives the request unless the app is quitting.
+        let _ = reply.send(result);
+    }
+}
+
+fn hold() -> keepawake::Result<keepawake::KeepAwake> {
+    // Display and idle, not `sleep`: that one needs AC power and does nothing
+    // under Windows Modern Standby, and the lid closing should still sleep.
+    keepawake::Builder::default()
+        .display(true)
+        .idle(true)
+        .reason("Herdr keeps the display awake")
+        .app_name("Herdr")
+        .app_reverse_domain(crate::constants::APP_ID)
+        .create()
+}
+
+#[cfg(test)]
+mod tests;

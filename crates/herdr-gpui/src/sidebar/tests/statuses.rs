@@ -140,6 +140,8 @@ fn symbol_rows_keep_layout_density_and_expand_child_indent() {
                         theme: &theme,
                         look: layout,
                         width: 160.,
+                        nest: 0.,
+                        mark: Default::default(),
                         host: None,
                     },
                 );

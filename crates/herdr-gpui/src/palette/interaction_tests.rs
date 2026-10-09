@@ -26,7 +26,17 @@ fn one_palette_combines_navigation_actions_commands_and_projects(cx: &mut TestAp
                 path: "/projects/herdr".into(),
                 label: "herdr".into(),
             });
-            view.prepare_palette_entries(&mut palette);
+            // And a note on the fixture's checkout, for the Notes filter.
+            let mut notes = crate::worktree_notes::Notes::default();
+            notes.set(
+                crate::worktree_notes::Checkout {
+                    endpoint: crate::endpoint::LOCAL.into(),
+                    repo_key: "repo/main".into(),
+                    branch: "main".into(),
+                },
+                "release blocker",
+            );
+            view.prepare_palette_entries(&mut palette, Some(&notes));
             view.menu.palette = Some(palette);
             view.rank_palette(Selection::Keep, cx);
             for filter in Filter::ALL {

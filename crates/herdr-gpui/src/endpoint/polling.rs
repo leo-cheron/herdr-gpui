@@ -1,7 +1,7 @@
 //! The window's periodic endpoint work: draining each connection, activating
 //! the selected surface, and probing sessions.
 use super::{ACTIVATION_TIMEOUT, LOCAL, Redraw};
-use crate::{HerdrWindow, state::ConnectionStatus};
+use crate::HerdrWindow;
 use gpui::{ClipboardItem, Context};
 use herdr_client::RemoteHost;
 use std::time::Instant;
@@ -29,10 +29,12 @@ impl HerdrWindow {
     }
 
     pub(crate) fn poll_endpoints(&mut self, cx: &mut Context<Self>) {
+        self.recover_after_sleep(Instant::now(), std::time::SystemTime::now());
         // Record the focused target the user last saw before a newer snapshot
         // can replace it; input held across a gap may only go there.
         self.flush_pending_input(cx);
         if let Some(error) = self.catalog.poll_write() {
+            crate::storage_warning::warn_storage_failure("Save host selection", &error);
             self.local_error = Some(format!("Save host selection: {error}"));
             cx.notify();
         }
@@ -40,7 +42,10 @@ impl HerdrWindow {
             match result {
                 Ok(update) => {
                     self.catalog.accept(&update);
-                    self.reconcile_catalog(update.hosts, update.wsl, cx);
+                    #[cfg(feature = "cloud")]
+                    self.reconcile_devices(update.hosts, update.wsl, update.cloud, cx);
+                    #[cfg(not(feature = "cloud"))]
+                    self.reconcile_devices(update.hosts, update.wsl, cx);
                 }
                 Err(error) => {
                     self.local_error = Some(format!("Host catalog: {error}"));
@@ -106,7 +111,7 @@ impl HerdrWindow {
         }
         let endpoint = &mut self.endpoints[self.selected_endpoint];
         if self.selected_generation != endpoint.generation {
-            self.reset_selected();
+            self.reset_selected(cx);
         }
         let endpoint = &mut self.endpoints[self.selected_endpoint];
         if selected_changed {
@@ -114,6 +119,21 @@ impl HerdrWindow {
             if !self.live.status.is_connected() {
                 self.local_error = None;
             }
+        }
+        if endpoint.outage().is_some() {
+            self.presentation.hold();
+        } else {
+            self.presentation.resume();
+        }
+        // Activation is timed from the snapshot it needs. An endpoint that is
+        // down or still handshaking is retried in place, never given up for Local.
+        // The handle stops before the disconnect state reaches the inbox, so
+        // `live` can still hold the lost connection's snapshot for a poll; the
+        // outage is recorded as soon as the stop is seen.
+        if (self.live.snapshot.is_none() || endpoint.outage().is_some())
+            && let Some(deadline) = &mut self.activation_deadline
+        {
+            *deadline = Instant::now() + ACTIVATION_TIMEOUT;
         }
         self.pending_releases
             .retain_mut(|release| !release.resolved());
@@ -167,7 +187,6 @@ impl HerdrWindow {
             .activation_deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
             || self.live.activation.as_ref().is_some_and(|a| a.failed)
-            || (self.selected_endpoint != 0 && self.live.status == ConnectionStatus::Disconnected)
         {
             let mut error = format!(
                 "{}: surface activation failed or timed out",
@@ -181,7 +200,7 @@ impl HerdrWindow {
             } else {
                 // Recover Local with a fresh active handshake, even if the
                 // previous surface lane or its acknowledgement was unavailable.
-                self.reconnect();
+                self.reconnect(cx);
             }
             self.local_error = Some(error);
             changed = Redraw::Window;

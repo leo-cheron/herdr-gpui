@@ -21,7 +21,7 @@ fn check_layouts(modes: &[crate::config::LayoutMode], cx: &mut gpui::TestAppCont
         view.live.snapshot = Some(Arc::new(snapshot_with_upstream()));
         let input = crate::pull_request::Input {
             checkout: None,
-            repo_key: REPO_KEY.into(),
+            repo_key: Some(REPO_KEY.into()),
             branch: "worktree/sidebar-child".into(),
         };
         let now = std::time::Instant::now();
@@ -42,6 +42,17 @@ fn check_layouts(modes: &[crate::config::LayoutMode], cx: &mut gpui::TestAppCont
                 repo_key: "/home/me/agent-launcher/.git".into(),
                 workspace_id: "w9".into(),
             },
+        });
+        // And a note, marked and read under the row.
+        crate::worktree_notes::Notes::update(cx, |notes| {
+            notes.set(
+                crate::worktree_notes::Checkout {
+                    endpoint: crate::endpoint::LOCAL.into(),
+                    repo_key: REPO_KEY.into(),
+                    branch: "worktree/sidebar-child".into(),
+                },
+                "wait for the FX rates PR before rebasing onto main",
+            )
         });
         view
     });
@@ -111,6 +122,13 @@ fn check_layouts(modes: &[crate::config::LayoutMode], cx: &mut gpui::TestAppCont
                     );
                     assert!(cx.debug_bounds("dirty-sidebar-child").is_some());
                 }
+                // Every layout reads the note on a line under its row.
+                let row = cx.debug_bounds("row-sidebar-child").unwrap();
+                let line = cx
+                    .debug_bounds("note-line-local-w4")
+                    .unwrap_or_else(|| panic!("{context}: no note line"));
+                assert_eq!(line.top(), row.bottom(), "{context}: note line");
+                assert!(line.right() <= sidebar.right(), "{context}: note line");
                 // Minimal rows leave upstream counts off too; the rest keep
                 // them inside the row, and never on a branch in sync.
                 if mode != LayoutMode::Minimal {
@@ -178,7 +196,7 @@ fn sidebar_densities_keep_details_and_badges_within_their_rows(cx: &mut gpui::Te
         view.live.snapshot = Some(Arc::new(snapshot(6)));
         let input = crate::pull_request::Input {
             checkout: None,
-            repo_key: REPO_KEY.into(),
+            repo_key: Some(REPO_KEY.into()),
             branch: "worktree/sidebar-child".into(),
         };
         let now = std::time::Instant::now();

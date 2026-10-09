@@ -4,23 +4,17 @@
 
 use super::{HerdrWindow, PressedLink};
 use crate::{
-    APP_VERSION, CheckForUpdates, Minimize, PlaySound, RunCommand, ShowHerdrNotDetected,
-    ShowUpdatePreview,
+    CheckForUpdates, Minimize, PlaySound, RunCommand, ShowHerdrNotDetected, ShowUpdatePreview,
     actions::{RingBellPreview, ShowToastPreview},
     browser::{Pick, Shown, Slot},
     config::ClipboardToastPosition,
     fonts::StyledFont,
-    state::ConnectionStatus,
     terminal::*,
     terminal_painter::{self, ImageTarget, PlacedImages},
 };
 use gpui::{prelude::*, *};
 use herdr_client::ConnectOptions;
-use std::time::{Duration, Instant};
-
-/// The status bar's 24-unit SVG icons pad their artwork, so they are drawn at
-/// this size to look as large as the 12px ring of the report-issue button.
-const STATUS_GLYPH: f32 = 16.;
+use std::time::Instant;
 
 impl HerdrWindow {
     /// Config warnings, then the daemon's announcement, stacked over the
@@ -520,6 +514,7 @@ impl Render for HerdrWindow {
                     .size_full(),
                 ),
             )
+            .children(self.render_reconnecting(cx))
             .when_some(find_bar, |terminal, bar| terminal.child(bar))
             .when_some(copy_badge, |terminal, badge| terminal.child(badge))
             // Direct feedback for the user's own gesture, not a daemon notice:
@@ -609,7 +604,12 @@ impl Render for HerdrWindow {
                         .as_ref()
                         .is_some_and(|location| !location.is_page()) =>
                 {
-                    self.render_review_tab(slot, &tab, gap, cx)
+                    match tab.location {
+                        Some(crate::browser::Location::Code { .. }) => {
+                            self.render_code_tab(slot, &tab, gap, cx)
+                        }
+                        _ => self.render_review_tab(slot, &tab, gap, cx),
+                    }
                 }
                 (Shown::Page(_), Some(tab)) => {
                     self.render_browser(slot, &tab, gap, owns_keyboard, cx)
@@ -633,6 +633,7 @@ impl Render for HerdrWindow {
             groups.push(self.render_group(slot, body, ends, window, cx));
         }
         let content = self.render_groups(groups, cx);
+        let content = self.render_beside_code(content, cx);
         // Not `||`: asking forgets group motion that has finished.
         if self.groups_moving() | self.tabs_growing() | self.annotations_moving() {
             window.request_animation_frame();
@@ -641,33 +642,37 @@ impl Render for HerdrWindow {
         if self.present_browser(cx) {
             window.request_animation_frame();
         }
-        let status = (!matches!(self.live.status, ConnectionStatus::Connected)
-            || self.local_error.is_some()
-            || self.live.error.is_some())
-        .then(|| self.live.status_text(self.local_error.as_deref()));
         let root = div()
             .on_modifiers_changed(cx.listener(Self::double_shift_modifiers))
             .capture_any_mouse_down(cx.listener(|this, _, _, _| this.shift_taps.cancel()))
             .child({
                 let entity = cx.weak_entity();
-                canvas(|_, _, _| (), move |_, _, window, _| {
-                    let scroll_entity = entity.clone();
-                    window.on_mouse_event(move |_: &ScrollWheelEvent, phase, _, cx| {
-                        if phase == DispatchPhase::Capture {
-                            let _ = scroll_entity.update(cx, |this, _| this.shift_taps.cancel());
-                        }
-                    });
-                    let entity = entity.clone();
-                    window.on_mouse_event(move |_: &MouseMoveEvent, phase, _, cx| {
-                        if phase == DispatchPhase::Capture {
-                            let _ = entity.update(cx, |this, _| this.shift_taps.cancel());
-                        }
-                    });
-                }).absolute().size_full()
+                canvas(
+                    |_, _, _| (),
+                    move |_, _, window, _| {
+                        let scroll_entity = entity.clone();
+                        window.on_mouse_event(move |_: &ScrollWheelEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Capture {
+                                let _ =
+                                    scroll_entity.update(cx, |this, _| this.shift_taps.cancel());
+                            }
+                        });
+                        let entity = entity.clone();
+                        window.on_mouse_event(move |_: &MouseMoveEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Capture {
+                                let _ = entity.update(cx, |this, _| this.shift_taps.cancel());
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .size_full()
             })
-            .on_action(cx.listener(|this, action: &crate::actions::SetLayout, _, cx| {
-                this.set_layout(action.mode, cx);
-            }))
+            .on_action(
+                cx.listener(|this, action: &crate::actions::SetLayout, _, cx| {
+                    this.set_layout(action.mode, cx);
+                }),
+            )
             .on_action(cx.listener(|this, action: &RunCommand, window, cx| {
                 this.command(action.command, window, cx);
             }))
@@ -684,20 +689,29 @@ impl Render for HerdrWindow {
             .on_action(cx.listener(|this, _: &ShowUpdatePreview, window, cx| {
                 this.open_app_update(true, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &crate::actions::ShowUpdateDownloadPreview, window, cx| {
-                this.open_update_progress_preview(
-                    crate::updater::State::Downloading { received: 50_000_000, total: 100_000_000 },
-                    window,
-                    cx,
-                );
-            }))
-            .on_action(cx.listener(|this, _: &crate::actions::ShowUpdateHomebrewPreview, window, cx| {
-                this.open_update_progress_preview(
-                    crate::updater::State::Upgrading { detail: "Refreshing Homebrew metadata with brew update...".into() },
-                    window,
-                    cx,
-                );
-            }))
+            .on_action(cx.listener(
+                |this, _: &crate::actions::ShowUpdateDownloadPreview, window, cx| {
+                    this.open_update_progress_preview(
+                        crate::updater::State::Downloading {
+                            received: 50_000_000,
+                            total: 100_000_000,
+                        },
+                        window,
+                        cx,
+                    );
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &crate::actions::ShowUpdateHomebrewPreview, window, cx| {
+                    this.open_update_progress_preview(
+                        crate::updater::State::Upgrading {
+                            detail: "Refreshing Homebrew metadata with brew update...".into(),
+                        },
+                        window,
+                        cx,
+                    );
+                },
+            ))
             .on_action(cx.listener(|this, action: &ShowToastPreview, _, cx| {
                 this.show_toast_preview(action.kind, cx);
             }))
@@ -738,255 +752,15 @@ impl Render for HerdrWindow {
                         div()
                             .flex()
                             .flex_col()
-                             .flex_1()
-                             .min_w_0()
-                             .min_h_0()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
                             .relative()
                             .child(content)
                             .children(self.render_notices(cx))
-                            .child(
-                div()
-                    .id("connection-status")
-                    .debug_selector(|| "connection-status".into())
-                    .flex()
-                    .flex_none()
-                    .h(px((self.config.ui.size * 1.5 + 4.).max(22.)))
-                    .overflow_hidden()
-                    .items_center()
-                    .gap(px(6.))
-                    .px_3()
-                    .bg(rgb(self.theme.surface))
-                    .text_color(rgb(self.theme.foreground))
-                    .children(self.render_usage(cx))
-                    .when_some(
-                        self.prefix_armed
-                            .then(|| self.keymap().prefix_label())
-                            .flatten(),
-                        |bar, prefix| bar.child(
-                            div()
-                                .debug_selector(|| "prefix-armed".into())
-                                .flex_none()
-                                .px(px(6.))
-                                .rounded(px(crate::config::corners::SMALL))
-                                .bg(rgb(self.theme.active))
-                                .child(prefix),
-                        ),
-                    )
-                    // The mode has no control on screen, so it says how it works.
-                    .when(self.resize_mode, |bar| bar.child(
-                        div()
-                            .debug_selector(|| "resize-mode".into())
-                            .flex_none()
-                            .px(px(6.))
-                            .rounded(px(crate::config::corners::SMALL))
-                            .bg(rgb(self.theme.active))
-                            .child("Resize"),
-                    ).child(
-                        div()
-                            .flex_none()
-                            .text_color(rgb(self.theme.muted))
-                            .child("h j k l or arrows resize, Esc ends"),
-                    ))
-                    .when(!self.live.status.is_connected(), |bar| bar.child(
-                        if matches!(self.live.status, ConnectionStatus::StartingDaemon) {
-                            div()
-                                .size(px(8.))
-                                .flex_none()
-                                .rounded_full()
-                                .bg(rgb(self.theme.ink(self.theme.palette[3])))
-                                .with_animation(
-                                    "daemon-starting-loader",
-                                    Animation::new(Duration::from_secs(1)).repeat(),
-                                    |dot, delta| {
-                                        dot.opacity(
-                                            0.3 + 0.7 * (delta * std::f32::consts::PI).sin(),
-                                        )
-                                    },
-                                )
-                                .into_any_element()
-                        } else {
-                            div()
-                                .size(px(6.))
-                                .flex_none()
-                                .rounded_full()
-                                .bg(rgb(self.theme.ink(self.theme.palette[1])))
-                                .into_any_element()
-                        },
-                    ))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .when_some(status, |row, status| row.child(
-                                div().debug_selector(|| "connection-message".into()).child(status)
-                            )),
-                    )
-                    .children(self.render_listening_ports(cx))
-                    .children(self.render_system_load())
-                    .when(crate::caffeine::SUPPORTED, |bar| {
-                        let awake = crate::caffeine::active(cx);
-                        let (foreground, surface) = (self.theme.foreground, self.theme.surface);
-                        bar.child(
-                            div()
-                                .id("status-caffeine")
-                                .debug_selector(|| "status-caffeine".into())
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .px_2()
-                                .h_full()
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(self.theme.active)))
-                                .child(
-                                    svg()
-                                        .path(if awake {
-                                            "icons/coffee-full.svg"
-                                        } else {
-                                            "icons/coffee.svg"
-                                        })
-                                        .size(px(STATUS_GLYPH))
-                                        .flex_none()
-                                        .text_color(rgb(if awake {
-                                            self.theme.primary()
-                                        } else {
-                                            self.theme.foreground
-                                        })),
-                                )
-                                .tooltip(move |_, cx| {
-                                    cx.new(|_| crate::usage::Hint {
-                                        text: if awake {
-                                            "Keeping the display awake".into()
-                                        } else {
-                                            "Keep the display awake".into()
-                                        },
-                                        foreground,
-                                        surface,
-                                    })
-                                    .into()
-                                })
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Err(error) = crate::caffeine::toggle(cx) {
-                                        this.show_flash(
-                                            super::Flash::warning(error.to_string()),
-                                            cx,
-                                        );
-                                    }
-                                })),
-                        )
-                    })
-                    .child(
-                        div()
-                                    .id("status-theme")
-                                    .debug_selector(|| "status-theme".into())
-                                    .flex_shrink_1()
-                                    .min_w(px(33.))
-                            .flex()
-                            .items_center()
-                            .gap(px(5.))
-                            .px_2()
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(self.theme.active)))
-                            .child(
-                                svg()
-                                    .path("icons/theme.svg")
-                                    .size(px(STATUS_GLYPH))
-                                    .flex_none()
-                                    .text_color(rgb(self.theme.foreground)),
-                            )
-                                    .child(div().min_w_0().truncate().child("Theme"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_theme_picker(window, cx);
-                            })),
-                    )
-                    .child(
-                        div()
-                                    .id("status-keybinds")
-                                    .debug_selector(|| "status-keybinds".into())
-                                    .flex_shrink_1()
-                                    .min_w(px(33.))
-                            .flex()
-                            .items_center()
-                            .gap(px(5.))
-                            .px_2()
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(self.theme.active)))
-                            .child(
-                                svg()
-                                    .path("icons/keyboard.svg")
-                                    .size(px(STATUS_GLYPH))
-                                    .flex_none()
-                                    .text_color(rgb(self.theme.foreground)),
-                            )
-                                    .child(div().min_w_0().truncate().child("Shortcuts"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_keybinds(window, cx);
-                            })),
-                    )
-                    .child(
-                        div()
-                                    .id("report-issue")
-                                    .debug_selector(|| "report-issue".into())
-                                    .flex_shrink_1()
-                                    .min_w(px(33.))
-                            .flex()
-                            .items_center()
-                            .gap(px(5.))
-                            .px_2()
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(self.theme.active)))
-                            .child(
-                                div()
-                                    .size(px(12.))
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_full()
-                                    .border_1()
-                                    .border_color(rgb(self.theme.foreground))
-                                    .child(
-                                        div()
-                                            .size(px(3.))
-                                            .rounded_full()
-                                            .bg(rgb(self.theme.foreground)),
-                                    ),
-                            )
-                                    .child(div().min_w_0().truncate().child("Report issue"))
-                            .on_click(|_, _, cx| {
-                                cx.open_url(&format!(
-                                    "https://github.com/penso/herdr-gpui/issues/new?template=bug_report.yml&version={}",
-                                    APP_VERSION.replace('+', "%2B"),
-                                ));
+                            .when(self.status_bar_visible, |column| {
+                                column.child(self.render_status_bar(cx))
                             }),
-                    )
-                    .child(
-                        div()
-                            .id("status-version")
-                            .debug_selector(|| "status-version".into())
-                            .flex_none()
-                            .whitespace_nowrap()
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(self.theme.active)))
-                            // A waiting update is the one status here worth
-                            // interrupting for, so it takes the accent color
-                            // the rest of the chrome reserves for chosen rows.
-                            .text_color(rgb(if self.updater.update_available() {
-                                self.theme.primary()
-                            } else {
-                                self.theme.muted
-                            }))
-                            .child(if self.updater.update_available() {
-                                "Update available"
-                            } else {
-                                APP_VERSION
-                            })
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_app_update(false, window, cx);
-                            })),
-                    ),
-                            ),
                     ),
             )
             .when(merged, |root| root.children(self.render_worktree_banner()))

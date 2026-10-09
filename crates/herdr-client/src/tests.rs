@@ -11,7 +11,7 @@ use crate::{
     method::Method,
     options::validate_options,
     protocol::{endpoint::*, *},
-    session::{Health, Pending, Session, SurfaceEncodings, run_connection},
+    session::{Health, Pending, Session, Signals, SurfaceEncodings, run_connection},
     transport::Stream,
 };
 use crossbeam_channel::bounded;
@@ -31,7 +31,9 @@ mod errors;
 mod framing;
 mod handshake;
 mod health;
+mod host_theme_order;
 mod host_themes;
+mod liveness;
 mod session_state;
 mod surface_encoding;
 mod surfaces;
@@ -124,6 +126,8 @@ fn test_client_mode(
     let (tx, events) = bounded(EVENT_CAPACITY);
     let stop = Arc::new(AtomicBool::new(false));
     let worker_stop = stop.clone();
+    let liveness = Arc::new(AtomicBool::new(false));
+    let worker_liveness = liveness.clone();
     let worker = thread::spawn(move || {
         run_connection(
             stream,
@@ -132,7 +136,10 @@ fn test_client_mode(
             remote,
             rx,
             &tx,
-            &worker_stop,
+            Signals {
+                stop: &worker_stop,
+                liveness: &worker_liveness,
+            },
         )
     });
     (
@@ -144,6 +151,7 @@ fn test_client_mode(
                     next_request: AtomicU64::new(1),
                     image_busy: Arc::new(AtomicBool::new(false)),
                     last_queued_theme: Default::default(),
+                    liveness,
                 }),
             },
             events,

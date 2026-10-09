@@ -1,4 +1,8 @@
 //! Independent native preferences window. Disk work never owns a window or a socket.
+#[cfg(feature = "cloud")]
+mod cloud_devices;
+#[cfg(feature = "daytona")]
+pub(crate) use cloud_devices::open as open_cloud;
 mod controls;
 mod layouts;
 pub(crate) use layouts::{apply_loaded_layout, layout_load_revision};
@@ -48,18 +52,28 @@ pub(super) enum Section {
     Indicators,
     Sound,
     Notifications,
+    StatusBar,
     Integrations,
+    Plugins,
+    Code,
+    #[cfg(feature = "cloud")]
+    CloudDevices,
     General,
 }
 
 impl Section {
-    const ALL: [Self; 7] = [
+    const ALL: &[Self] = &[
         Self::Appearance,
         Self::Fonts,
         Self::Indicators,
         Self::Sound,
         Self::Notifications,
+        Self::StatusBar,
         Self::Integrations,
+        Self::Plugins,
+        Self::Code,
+        #[cfg(feature = "cloud")]
+        Self::CloudDevices,
         Self::General,
     ];
 
@@ -70,7 +84,12 @@ impl Section {
             Self::Indicators => "Indicators",
             Self::Sound => "Sound",
             Self::Notifications => "Notifications",
+            Self::StatusBar => "Status bar",
             Self::Integrations => "Integrations",
+            Self::Plugins => "Plugins",
+            Self::Code => "Code",
+            #[cfg(feature = "cloud")]
+            Self::CloudDevices => "Cloud Devices",
             Self::General => "General",
         }
     }
@@ -82,7 +101,12 @@ impl Section {
             Self::Indicators => "icons/pulse.svg",
             Self::Sound => "icons/chart.svg",
             Self::Notifications => "icons/bell.svg",
+            Self::StatusBar => "icons/status-bar.svg",
             Self::Integrations => "icons/agent-generic.svg",
+            Self::Plugins => "icons/plug.svg",
+            Self::Code => "icons/vscode.svg",
+            #[cfg(feature = "cloud")]
+            Self::CloudDevices => "icons/globe.svg",
             Self::General => "icons/settings.svg",
         }
     }
@@ -94,7 +118,16 @@ impl Section {
             Self::Indicators => "See what your agents are doing at a glance.",
             Self::Sound => "A little signal when something needs you.",
             Self::Notifications => "Stay informed without losing your place.",
+            Self::StatusBar => "Keep the bottom bar to what you use.",
             Self::Integrations => "Connect the agents you work with.",
+            Self::Plugins => "Show what your plugins report in the sidebar.",
+            Self::Code => {
+                "Review code and diffs beside your terminals by connecting to a Visual Studio Code server."
+            }
+            #[cfg(feature = "cloud")]
+            Self::CloudDevices => {
+                "Create machines from your cloud accounts and use them as devices."
+            }
             Self::General => "The small details of your daily workflow.",
         }
     }
@@ -180,10 +213,14 @@ struct SettingsWindow {
     section: Section,
     themes: themes::ThemeBrowser,
     controls: controls::Controls,
+    plugins: controls::plugins::Plugins,
+    code: controls::code::CodeSettings,
     error: Option<String>,
     status: Option<String>,
     focus: FocusHandle,
     body_scroll: ScrollHandle,
+    /// The category list scrolls when the window is too short for it.
+    navigation_scroll: ScrollHandle,
     /// The section list's width, dragged by its right edge.
     navigation_width: crate::panel_resize::PanelWidth,
     /// The window's width at its last render, which caps the section list.
@@ -199,6 +236,12 @@ struct SettingsWindow {
     _source: Option<Subscription>,
     _appearance: Option<Subscription>,
     _watch: Option<Task<()>>,
+    /// The config files as our last save left them, for the watcher to accept
+    /// so the save's own write does not trigger a second reload.
+    saved_sample: Option<persistence::Sample>,
+    /// Enumerating system fonts takes hundreds of milliseconds, so each
+    /// Settings window does it once rather than on every load.
+    installed_fonts: std::sync::Arc<std::sync::OnceLock<Vec<String>>>,
     load_revision: u64,
     theme_revision: u64,
     theme_intent: Option<themes::ThemeIntent>,
@@ -208,6 +251,17 @@ struct SettingsWindow {
     #[cfg(test)]
     layout_io: Option<layouts::LayoutIo>,
     remote_history: remote_history::RemoteHistory,
+    /// The Coder card, built when Cloud Devices is first shown.
+    /// The provider whose tab Cloud Devices shows.
+    #[cfg(feature = "cloud")]
+    cloud_tab: crate::cloud::CloudProvider,
+    /// The main window's finished cloud jobs when the cards last read them.
+    #[cfg(feature = "cloud")]
+    cloud_jobs_seen: u64,
+    #[cfg(feature = "coder")]
+    coder_card: Option<cloud_devices::CoderCard>,
+    #[cfg(feature = "daytona")]
+    daytona_card: Option<cloud_devices::DaytonaCard>,
     theme_loading: bool,
     theme_waiting: bool,
     theme_light: bool,
@@ -262,10 +316,12 @@ impl SettingsWindow {
             section: Section::Appearance,
             themes: themes::ThemeBrowser::new(cx),
             controls: controls::Controls::new(cx),
+            plugins: controls::plugins::Plugins::new(cx),
             error: appearance.error,
             status: None,
             focus: cx.focus_handle(),
             body_scroll: ScrollHandle::new(),
+            navigation_scroll: ScrollHandle::new(),
             navigation_width: crate::panel_resize::SETTINGS_NAVIGATION,
             viewport_width: 0.,
             loading: false,
@@ -279,6 +335,8 @@ impl SettingsWindow {
             _source: subscription,
             _appearance: None,
             _watch: None,
+            saved_sample: None,
+            installed_fonts: Default::default(),
             load_revision: 0,
             theme_revision: 0,
             theme_intent: None,
@@ -288,6 +346,15 @@ impl SettingsWindow {
             #[cfg(test)]
             layout_io: None,
             remote_history: Default::default(),
+            code: Default::default(),
+            #[cfg(feature = "cloud")]
+            cloud_tab: cloud_devices::first_tab(),
+            #[cfg(feature = "cloud")]
+            cloud_jobs_seen: 0,
+            #[cfg(feature = "coder")]
+            coder_card: None,
+            #[cfg(feature = "daytona")]
+            daytona_card: None,
             theme_loading: false,
             theme_waiting: false,
             theme_light: false,
@@ -322,8 +389,12 @@ impl SettingsWindow {
         }
     }
 
-    fn source_changed(&mut self, _source: Entity<HerdrWindow>, cx: &mut Context<Self>) {
-        if self.section == Section::Integrations {
+    fn source_changed(&mut self, source: Entity<HerdrWindow>, cx: &mut Context<Self>) {
+        #[cfg(feature = "cloud")]
+        self.cloud_source_changed(&source, cx);
+        #[cfg(not(feature = "cloud"))]
+        let _ = source;
+        if matches!(self.section, Section::Integrations | Section::Plugins) {
             cx.notify();
         }
         if self.section == Section::General {
@@ -445,6 +516,9 @@ impl SettingsWindow {
         if !self.finish_control_size_edit(true, cx) {
             return false;
         }
+        if !self.finish_code_edit(true, cx) {
+            self.finish_code_edit(false, cx);
+        }
         if !self.theme_dirty() && self.layout_intent.is_none() && !self.busy() {
             return true;
         }
@@ -503,8 +577,14 @@ impl SettingsWindow {
         if !self.finish_control_size_edit(true, cx) {
             self.finish_control_size_edit(false, cx);
         }
+        if !self.finish_code_edit(true, cx) {
+            self.finish_code_edit(false, cx);
+        }
         self.dismiss_control_font_picker(window, cx);
         self.section = section;
+        if section == Section::Code {
+            self.open_code_page(window, cx);
+        }
         self.body_scroll.set_offset(Point::default());
         window.focus(&self.focus, cx);
         if section == Section::Integrations {
@@ -514,6 +594,10 @@ impl SettingsWindow {
         }
         if section == Section::General {
             self.sync_remote_history(false, cx);
+        }
+        #[cfg(feature = "cloud")]
+        if section == Section::CloudDevices {
+            self.open_cloud_devices(cx);
         }
         cx.notify();
     }
@@ -573,46 +657,62 @@ impl SettingsWindow {
                             .child("Settings"),
                     ),
             )
-            .children(
-                Section::ALL
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, section)| {
-                        let selected = self.section == section;
-                        div()
-                            .id(("settings-section", index))
-                            .relative()
-                            .map(|row| {
-                                #[cfg(all(feature = "integration-test", target_os = "macos"))]
-                                let row = row.child(native::probe(index));
-                                row
-                            })
-                            .debug_selector(move || format!("settings-section-{index}"))
-                            .flex()
-                            .items_center()
-                            .gap(px(10.))
-                            .px(px(10.))
-                            .py(px(11.))
-                            .rounded(px(corners::CONTROL))
-                            .cursor_pointer()
-                            .when(selected, |el| el.bg(rgb(theme.primary_wash())))
-                            .hover(|el| el.bg(rgb(theme.active)))
-                            .child(
-                                svg()
-                                    .path(section.icon())
-                                    .size(px(17.))
-                                    .flex_none()
-                                    .text_color(rgb(if selected {
-                                        theme.primary()
-                                    } else {
-                                        theme.subtext()
-                                    })),
-                            )
-                            .child(section.label())
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.select_section(section, window, cx)
-                            }))
-                    }),
+            .child(
+                div()
+                    .id("settings-sections")
+                    .debug_selector(|| "settings-sections".into())
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.navigation_scroll)
+                    .children(
+                        Section::ALL
+                            .iter()
+                            .copied()
+                            .enumerate()
+                            .map(|(index, section)| {
+                                let selected = self.section == section;
+                                div()
+                                    .id(("settings-section", index))
+                                    .relative()
+                                    .map(|row| {
+                                        #[cfg(all(
+                                            feature = "integration-test",
+                                            target_os = "macos"
+                                        ))]
+                                        let row = row.child(native::probe(index));
+                                        row
+                                    })
+                                    .debug_selector(move || format!("settings-section-{index}"))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(10.))
+                                    .px(px(10.))
+                                    .py(px(11.))
+                                    .rounded(px(corners::CONTROL))
+                                    .cursor_pointer()
+                                    .when(selected, |el| el.bg(rgb(theme.primary_wash())))
+                                    .hover(|el| el.bg(rgb(theme.active)))
+                                    .child(
+                                        svg()
+                                            .path(section.icon())
+                                            .size(px(17.))
+                                            .flex_none()
+                                            .text_color(rgb(if selected {
+                                                theme.primary()
+                                            } else {
+                                                theme.subtext()
+                                            })),
+                                    )
+                                    .child(section.label())
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.select_section(section, window, cx)
+                                    }))
+                            }),
+                    ),
             )
     }
 }
@@ -622,6 +722,10 @@ impl Render for SettingsWindow {
         let content = match self.section {
             Section::Appearance => self.render_appearance(window, cx),
             Section::Integrations => self.render_integration_controls(cx),
+            Section::Plugins => self.render_plugin_controls(cx),
+            Section::Code => self.render_code_controls(window, cx),
+            #[cfg(feature = "cloud")]
+            Section::CloudDevices => self.render_cloud_devices(cx),
             _ => self.render_controls(window, cx),
         };
         self.viewport_width = f32::from(window.viewport_size().width);
@@ -638,6 +742,7 @@ impl Render for SettingsWindow {
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, action: &crate::RunCommand, window, cx| {
                 match action.command {
+                    command if crate::window::run_window_command(command, window, cx) => {}
                     crate::controls::Command::Settings => window.activate_window(),
                     crate::controls::Command::NewWindow => {
                         if let Some(target) = this.additional_window_target(cx) {
@@ -716,17 +821,22 @@ impl Render for SettingsWindow {
                                     }
                                 })
                                 .unwrap_or_else(|| {
-                                    if self.section == Section::Appearance {
-                                        "Themes and layouts change live; saved on Settings close or app quit."
-                                    } else {
-                                        "Changes are saved automatically."
+                                    match self.section {
+                                        Section::Appearance => {
+                                            "Themes and layouts change live; saved on Settings close or app quit."
+                                        }
+                                        #[cfg(feature = "cloud")]
+                                        Section::CloudDevices => {
+                                            "Account fields save with Save; sign-in and removal apply at once."
+                                        }
+                                        _ => "Changes are saved automatically.",
                                     }
                                     .into()
                                 }),
                         ),
                     )
                     .child(
-                        self.control_choice("settings-footer-reload", "Reload", false, !self.busy())
+                        self.control_choice("settings-footer-reload", "Reload", false, true)
                             .debug_selector(|| "settings-footer-reload".into())
                             .flex_none()
                             .px(px(10.))

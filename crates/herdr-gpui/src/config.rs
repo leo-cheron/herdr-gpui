@@ -7,15 +7,28 @@ use crate::{
     contrast::Contrast,
     keymap::{Binding, DaemonKeys, Keymap, PaneKeys},
 };
+mod bitmap_fonts;
+mod coder;
+mod daytona;
 mod files;
 mod fonts;
 mod layout;
 mod notifications;
 pub(crate) mod preferences;
 pub(crate) mod sidebar;
+mod sidebar_style;
+pub(crate) mod status_bar;
+#[cfg(feature = "cloud")]
+mod table;
 mod theme;
 pub(crate) mod watch;
 
+pub use coder::CoderConfig;
+#[cfg(feature = "coder")]
+pub(crate) use coder::CoderFields;
+pub use daytona::DaytonaConfig;
+#[cfg(feature = "daytona")]
+pub(crate) use daytona::DaytonaFields;
 use files::write_config;
 pub(crate) use fonts::FontFace;
 use fonts::FontSettings;
@@ -29,8 +42,11 @@ pub use notifications::{BellConfig, ClipboardToast, ClipboardToastPosition, Noti
 use notifications::{ClipboardToastSettings, NotificationSettings};
 use serde::Deserialize;
 pub(crate) use sidebar::{
-    AgentLayout, AgentToken, Rows, SidebarLayout, SpaceLayout, SpaceToken, TokenStyle,
+    AgentLayout, AgentToken, MAX_ROWS as MAX_SIDEBAR_ROWS, Rows, SidebarConfigError, SidebarLayout,
+    SidebarScope, SpaceLayout, SpaceToken, TokenStyle,
 };
+pub use sidebar_style::{SelectMode, SidebarOverrides, SidebarStyle};
+pub use status_bar::StatusBar;
 use std::{
     collections::BTreeMap,
     env, fs,
@@ -70,11 +86,18 @@ pub struct Config {
     pub agent_checkpoints: bool,
     /// Ports each workspace listens on, in the sidebar and the status bar.
     pub show_listening_ports: bool,
+    /// Which status bar items show, and how compactly.
+    pub status_bar: StatusBar,
     /// How far the app's own marks and labels stand off its chrome.
     pub contrast: Contrast,
     pub usage: crate::usage::UsageConfig,
     pub option_as_alt: OptionAsAlt,
     pub open_links_in: LinkTarget,
+    pub code: CodeConfig,
+    /// Where a link-modifier click on a printed file path opens it.
+    pub open_files_in: FileTarget,
+    /// How the editor starts; the pane's `$VISUAL` or `$EDITOR` when unset.
+    pub(crate) editor_command: Option<crate::editor::EditorCommand>,
     /// Whether a terminal selection stays highlighted, and readable by
     /// selection tools, after it is copied.
     pub keep_selection_after_copy: bool,
@@ -83,12 +106,16 @@ pub struct Config {
     pub terminal: FontConfig,
     pub ui: FontConfig,
     pub github: GitHubConfig,
+    pub coder: CoderConfig,
+    pub daytona: DaytonaConfig,
     pub features: Features,
     pub notifications: NotificationConfig,
     pub(crate) notification_overrides: NotificationSettings,
     pub clipboard_toast: ClipboardToast,
     pub bell: BellConfig,
     pub layout: Layout,
+    /// Spacing overrides, host colours, and selection marking for the sidebar.
+    pub sidebar_style: SidebarStyle,
     /// Daemon sidebar rows, falling back to defaults when invalid.
     pub sidebar_layout: SidebarLayout,
     pub keybindings: Keymap,
@@ -105,6 +132,13 @@ pub struct Config {
     /// ignored, as Herdr ignores its own, so a config written by a newer
     /// build or with a typo still loads; `diagnostic` reports them.
     pub unknown_keys: Vec<String>,
+    /// Font resolution searched for an icon font for the terminal and found
+    /// none installed, so Private Use Area glyphs draw as missing-glyph boxes.
+    /// Never set when the config names the terminal's `fallback` itself.
+    pub(crate) icon_font_missing: bool,
+    /// Configured families, sorted, that font resolution found no installed
+    /// family for; `diagnostic` reports them.
+    pub(crate) missing_fonts: Vec<String>,
 }
 
 /// A device list larger than any real catalog is a config mistake.
@@ -152,33 +186,97 @@ pub enum LinkTarget {
     BrowserTab,
 }
 
+/// The VS Code panel beside a space's editor groups, served by
+/// `code serve-web`. Each space that shows it gets
+/// its own page, which starts at `url` and then goes wherever it navigates.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CodeConfig {
+    /// `None` leaves the panel empty, with a hint to set it.
+    pub(crate) url: Option<crate::browser::WebUrl>,
+}
+
+/// Where a clicked file path opens. Alt-click (Option on macOS) opens it in
+/// the other one.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FileTarget {
+    /// The terminal editor, in a pane beside the one that printed the path.
+    /// Folders, images, and PDFs still open in the system's application.
+    #[default]
+    Editor,
+    /// The system's default application.
+    System,
+}
+
 /// Whether macOS Option sends Alt shortcuts to a pane or types the character
 /// the keyboard layout puts on it. Other platforms have no Option layer, so
 /// Alt always reaches the pane there.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OptionAsAlt {
-    /// Alt on the U.S. and ABC layouts, whose Option layer only holds symbols
-    /// like `π`; typing elsewhere, where it holds `@`, `[`, or letters.
+    /// The left Option sends Alt on the U.S. and ABC layouts, whose Option
+    /// layer only holds symbols like `π` and dead keys like `´`; the right
+    /// Option still types them. Both type elsewhere, where Option holds `@`,
+    /// `[`, or letters.
     #[default]
     Auto,
     Always,
     Never,
+    /// Only the left Option sends Alt; the right one types.
+    Left,
+    /// Only the right Option sends Alt; the left one types.
+    Right,
+}
+
+/// Which Option keys a keystroke was made with, as macOS reports them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OptionKeys {
+    pub left: bool,
+    pub right: bool,
+}
+
+impl OptionKeys {
+    /// What a keystroke whose side is unknown counts as: the left key,
+    /// which is where Alt has always been.
+    pub const LEFT: Self = Self {
+        left: true,
+        right: false,
+    };
+
+    /// The side from an `NSEvent`'s modifier flags, whose device-dependent
+    /// bits tell the two keys apart. Flags naming neither count as the left.
+    #[cfg(any(target_os = "macos", test))]
+    pub fn from_device_flags(flags: usize) -> Self {
+        const LEFT: usize = 0x20;
+        const RIGHT: usize = 0x40;
+        let keys = Self {
+            left: flags & LEFT != 0,
+            right: flags & RIGHT != 0,
+        };
+        if keys.left || keys.right {
+            keys
+        } else {
+            Self::LEFT
+        }
+    }
 }
 
 impl OptionAsAlt {
     /// macOS layouts whose Option characters a terminal user rarely types.
     const ALT_LAYOUTS: [&'static str; 2] = ["com.apple.keylayout.US", "com.apple.keylayout.ABC"];
 
-    /// Whether Option-modified keys go to the pane as Alt under `layout`, the
-    /// platform keyboard layout ID.
-    pub fn sends_alt(self, layout: &str) -> bool {
+    /// Whether Option-modified keys made with `keys` go to the pane as Alt
+    /// under `layout`, the platform keyboard layout ID.
+    pub fn sends_alt(self, layout: &str, keys: OptionKeys) -> bool {
         if !cfg!(target_os = "macos") {
             return true;
         }
         match self {
-            Self::Auto => Self::ALT_LAYOUTS.contains(&layout),
+            Self::Auto => Self::ALT_LAYOUTS.contains(&layout) && keys.left,
             Self::Always => true,
             Self::Never => false,
+            Self::Left => keys.left,
+            Self::Right => keys.right,
         }
     }
 }
@@ -193,11 +291,16 @@ impl<'de> Deserialize<'de> for OptionAsAlt {
             Bool(bool),
             Name(String),
         }
+        const NAMES: &[&str] = &["auto", "left", "right"];
         match Value::deserialize(deserializer)? {
             Value::Bool(true) => Ok(Self::Always),
             Value::Bool(false) => Ok(Self::Never),
-            Value::Name(name) if name == "auto" => Ok(Self::Auto),
-            Value::Name(name) => Err(serde::de::Error::unknown_variant(&name, &["auto"])),
+            Value::Name(name) => match name.as_str() {
+                "auto" => Ok(Self::Auto),
+                "left" => Ok(Self::Left),
+                "right" => Ok(Self::Right),
+                _ => Err(serde::de::Error::unknown_variant(&name, NAMES)),
+            },
         }
     }
 }
@@ -271,16 +374,22 @@ impl Default for Config {
         Self {
             theme: "Default".into(),
             github: GitHubConfig::default(),
+            coder: CoderConfig::default(),
+            daytona: DaytonaConfig::default(),
             confirm_close_tab: true,
             confirm_close_pane: true,
             show_agents: true,
             show_system_load: true,
             agent_checkpoints: true,
             show_listening_ports: true,
+            status_bar: StatusBar::default(),
             contrast: Contrast::default(),
             usage: crate::usage::UsageConfig::default(),
             option_as_alt: OptionAsAlt::default(),
             open_links_in: LinkTarget::default(),
+            code: CodeConfig::default(),
+            open_files_in: FileTarget::default(),
+            editor_command: None,
             keep_selection_after_copy: true,
             features: Features::default(),
             notifications: NotificationConfig::default(),
@@ -288,12 +397,15 @@ impl Default for Config {
             clipboard_toast: ClipboardToast::default(),
             bell: BellConfig::default(),
             layout: Layout::default(),
+            sidebar_style: SidebarStyle::default(),
             sidebar_layout: SidebarLayout::default(),
             keybindings: Keymap::default(),
             keybinding_overrides: BTreeMap::new(),
             pane_keys: PaneKeys::new(),
             devices: BTreeMap::new(),
             unknown_keys: Vec::new(),
+            icon_font_missing: false,
+            missing_fonts: Vec::new(),
             palette: crate::palette::PaletteConfig::default(),
             sidebar: font(monospace, 12.0),
             // Tabs are terminal chrome, so they read in the monospace face the
@@ -315,16 +427,22 @@ struct Settings {
     show_system_load: Option<bool>,
     agent_checkpoints: Option<bool>,
     show_listening_ports: Option<bool>,
+    status_bar: StatusBar,
     contrast: Contrast,
     usage: crate::usage::UsageConfig,
     option_as_alt: OptionAsAlt,
     open_links_in: LinkTarget,
+    code: CodeConfig,
+    open_files_in: FileTarget,
+    editor_command: Option<crate::editor::EditorCommand>,
     keep_selection_after_copy: Option<bool>,
-    sidebar: FontSettings,
+    sidebar: sidebar_style::SidebarSettings,
     tabs: FontSettings,
     terminal: FontSettings,
     ui: FontSettings,
     github: GitHubConfig,
+    coder: CoderConfig,
+    daytona: DaytonaConfig,
     features: Features,
     notifications: NotificationSettings,
     clipboard_toast: ClipboardToastSettings,
@@ -464,20 +582,33 @@ impl Config {
         Ok(Self::path()?.with_extension("local.toml"))
     }
 
-    /// A one-line warning naming the keys this build ignored, if any.
+    /// Warnings naming the keys this build ignored and the configured fonts
+    /// that are not installed, one line each, if any.
     pub(crate) fn diagnostic(&self) -> Option<String> {
         const LISTED: usize = 5;
-        if self.unknown_keys.is_empty() {
-            return None;
-        }
-        let listed = self.unknown_keys[..self.unknown_keys.len().min(LISTED)].join(", ");
-        let more = match self.unknown_keys.len().saturating_sub(LISTED) {
-            0 => String::new(),
-            more => format!(" and {more} more"),
+        let list = |items: &[String]| {
+            let listed = items[..items.len().min(LISTED)].join(", ");
+            match items.len().saturating_sub(LISTED) {
+                0 => listed,
+                more => format!("{listed} and {more} more"),
+            }
         };
-        Some(format!(
-            "config-gpui.local.toml: ignoring unknown keys {listed}{more}"
-        ))
+        let mut lines = Vec::new();
+        if !self.unknown_keys.is_empty() {
+            lines.push(format!(
+                "config-gpui.local.toml: ignoring unknown keys {}",
+                list(&self.unknown_keys)
+            ));
+        }
+        if !self.missing_fonts.is_empty() {
+            let fonts: Vec<String> = self
+                .missing_fonts
+                .iter()
+                .map(|family| format!("\"{family}\""))
+                .collect();
+            lines.push(format!("Configured fonts not installed: {}", list(&fonts)));
+        }
+        (!lines.is_empty()).then(|| lines.join("\n"))
     }
 
     pub fn load() -> Result<Self> {
@@ -573,7 +704,7 @@ impl Config {
         // fixed chrome, so there it is ignored like any other unknown key.
         unknown_keys.extend(
             [
-                ("sidebar", &mut settings.sidebar),
+                ("sidebar", &mut settings.sidebar.font),
                 ("tabs", &mut settings.tabs),
                 ("ui", &mut settings.ui),
             ]
@@ -600,6 +731,14 @@ impl Config {
         };
         settings.github.client_id_with_override(None)?;
         config.github = settings.github;
+        // Check what the file says so a bad value is reported at load; the
+        // environment may still fill or override keys when Coder is used.
+        #[cfg(feature = "coder")]
+        settings.coder.check()?;
+        config.coder = settings.coder;
+        #[cfg(feature = "daytona")]
+        settings.daytona.settings_with(|_| None)?;
+        config.daytona = settings.daytona;
         config.features = settings.features;
         config.notification_overrides = settings.notifications;
         config.notifications = settings
@@ -614,6 +753,7 @@ impl Config {
             return Err(Error::InvalidSidebarGap);
         }
         config.layout = settings.layout;
+        config.sidebar_style = settings.sidebar.style()?;
         config.keybindings =
             Keymap::with_overrides(&settings.keybindings, &settings.pane_keys, &base.keys)?;
         config.keybinding_overrides = settings.keybindings;
@@ -637,13 +777,17 @@ impl Config {
         config.show_system_load = settings.show_system_load.unwrap_or(true);
         config.agent_checkpoints = settings.agent_checkpoints.unwrap_or(true);
         config.show_listening_ports = settings.show_listening_ports.unwrap_or(true);
+        config.status_bar = settings.status_bar;
         config.contrast = settings.contrast;
         config.usage = settings.usage;
         config.option_as_alt = settings.option_as_alt;
         config.open_links_in = settings.open_links_in;
+        config.code = settings.code;
+        config.open_files_in = settings.open_files_in;
+        config.editor_command = settings.editor_command;
         config.keep_selection_after_copy = settings.keep_selection_after_copy.unwrap_or(true);
         for (name, font, settings) in [
-            ("sidebar", &mut config.sidebar, settings.sidebar),
+            ("sidebar", &mut config.sidebar, settings.sidebar.font),
             ("tabs", &mut config.tabs, settings.tabs),
             ("terminal", &mut config.terminal, settings.terminal),
             ("ui", &mut config.ui, settings.ui),

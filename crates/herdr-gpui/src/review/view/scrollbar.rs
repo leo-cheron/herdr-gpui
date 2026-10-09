@@ -2,6 +2,9 @@
 //! the view sits and how much of the diff it holds, and drags it. Its size
 //! and travel are the tab strip's thumb math, turned on its side. Side by
 //! side, the line between the halves drags here too, over every row.
+//!
+//! Wrapped rows are only measured once they lay out, so the rest count as
+//! one line each: the thumb is an estimate that settles as the diff scrolls.
 use super::Layout;
 use crate::browser::TabId;
 use crate::{
@@ -10,6 +13,7 @@ use crate::{
     panel_resize::{PanelDrag, divider},
 };
 use gpui::{prelude::*, *};
+use std::{cell::Cell, rc::Rc};
 
 /// How wide the thumb draws, and its margin from the list's edge.
 const WIDTH: f32 = 8.;
@@ -24,17 +28,40 @@ const HELD_ALPHA: u32 = 0xc0;
 #[derive(Clone, Copy, Debug)]
 struct DiffThumb;
 
+/// Gives the rows the list has not measured a one-line height whenever
+/// its width changes, which makes it forget them, so the thumb's size and
+/// travel stay close; laid out after the list, then draws again.
+fn keep_hints(
+    state: ListState,
+    hinted: Rc<Cell<Option<Pixels>>>,
+    line: Pixels,
+) -> impl IntoElement {
+    canvas(
+        move |_, window, _| {
+            let width = state.viewport_bounds().size.width;
+            if width <= px(0.) || hinted.get() == Some(width) {
+                return;
+            }
+            hinted.set(Some(width));
+            state.clone().with_uniform_item_height(line);
+            window.refresh();
+        },
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .size_0()
+}
+
 impl HerdrWindow {
     /// The thumb as the list last laid out; none while it all fits.
     fn review_thumb(&self, id: TabId) -> Option<(Thumb, Bounds<Pixels>, f32)> {
         let review = self.reviews.get(&id)?;
-        let handle = review.scroll.0.borrow().base_handle.clone();
-        let bounds = handle.bounds();
-        let max = f32::from(handle.max_offset().y);
+        let bounds = review.scroll.viewport_bounds();
+        let max = f32::from(review.scroll.max_offset_for_scrollbar().y);
         let thumb = Thumb::of(
             f32::from(bounds.size.height),
             max,
-            -f32::from(handle.offset().y),
+            -f32::from(review.scroll.scroll_px_offset_for_scrollbar().y),
         )?;
         Some((thumb, bounds, max))
     }
@@ -58,12 +85,13 @@ impl HerdrWindow {
         };
         let top = f32::from(y - bounds.top()) - review.grab;
         let scrolled = thumb.scrolled_at(f32::from(bounds.size.height), max, top);
-        let handle = review.scroll.0.borrow().base_handle.clone();
-        let offset = handle.offset();
+        let offset = review.scroll.scroll_px_offset_for_scrollbar();
         if (f32::from(offset.y) + scrolled).abs() < 0.5 {
             return false;
         }
-        handle.set_offset(point(offset.x, px(-scrolled)));
+        review
+            .scroll
+            .set_offset_from_scrollbar(point(offset.x, px(-scrolled)));
         true
     }
 
@@ -102,7 +130,7 @@ impl HerdrWindow {
         });
         // The halves split the list's width, as it last laid out.
         let split = self.reviews.get(&id).and_then(|review| {
-            let width = review.scroll.0.borrow().base_handle.bounds().size.width;
+            let width = review.scroll.viewport_bounds().size.width;
             (review.layout == Layout::Split && width > px(0.)).then(|| width * review.split_ratio)
         });
         let split = split.map(|x| {
@@ -114,6 +142,13 @@ impl HerdrWindow {
                     this.reset_review_split(id);
                     cx.notify();
                 }),
+            )
+        });
+        let hints = self.reviews.get(&id).map(|review| {
+            keep_hints(
+                review.scroll.clone(),
+                review.hinted.clone(),
+                px(self.review_line_height()),
             )
         });
         div()
@@ -140,6 +175,7 @@ impl HerdrWindow {
                 }),
             )
             .child(list)
+            .children(hints)
             .children(split)
             .children(thumb)
     }

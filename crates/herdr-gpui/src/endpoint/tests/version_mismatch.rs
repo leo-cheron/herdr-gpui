@@ -6,6 +6,7 @@ fn refuse(endpoint: &mut Endpoint, mismatch: VersionMismatch) {
     inbox.apply(ClientEvent::VersionMismatch(mismatch));
     inbox.apply(ClientEvent::Disconnected {
         reason: "Herdr server 0.8.2 is too old".into(),
+        ssh: None,
     });
 }
 

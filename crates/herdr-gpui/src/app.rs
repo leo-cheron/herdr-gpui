@@ -125,6 +125,22 @@ pub(crate) fn open_window(
     )
 }
 
+/// The app's one sound worker. Each window holds its own connection and the
+/// daemon sends every notification to each of them, so a worker per window
+/// played one notification once per open window.
+struct SharedSound(std::rc::Rc<crate::sound::Service>);
+
+impl Global for SharedSound {}
+
+fn shared_sound(cx: &mut App) -> std::rc::Rc<crate::sound::Service> {
+    if let Some(shared) = cx.try_global::<SharedSound>() {
+        return shared.0.clone();
+    }
+    let sound = std::rc::Rc::new(crate::sound::Service::new());
+    cx.set_global(SharedSound(sound.clone()));
+    sound
+}
+
 /// Opens another window from inside the focused window's own update.
 pub(crate) fn open_additional_window(target: ConnectTarget, cx: &mut App) {
     cx.defer(move |cx| {
@@ -135,10 +151,11 @@ pub(crate) fn open_additional_window(target: ConnectTarget, cx: &mut App) {
             #[cfg(feature = "integration-test")]
             false,
         );
+        let sound = shared_sound(cx);
         match opened {
             Ok(handle) => {
                 let _ = handle.update(cx, |view, window, _| {
-                    view.sound = crate::sound::Service::new();
+                    view.sound = sound;
                     window.activate_window();
                 });
             }
@@ -257,6 +274,18 @@ pub(crate) fn run() -> std::process::ExitCode {
     } else {
         crate::browser::Layouts::default()
     };
+    // Nor with the user's worktree notes, which they would overwrite.
+    let worktree_notes = if mode == LaunchMode::Normal {
+        crate::worktree_notes::Notes::load()
+    } else {
+        crate::worktree_notes::Notes::default()
+    };
+    // Nor with where the user's worktrees went.
+    let dispatch_history = if mode == LaunchMode::Normal {
+        crate::dispatch::History::load()
+    } else {
+        crate::dispatch::History::default()
+    };
     gpui_platform::application()
         .with_assets(icons::Icons)
         .run(move |cx| {
@@ -266,6 +295,8 @@ pub(crate) fn run() -> std::process::ExitCode {
             }
             browser_tabs.install(cx);
             group_layouts.install(cx);
+            worktree_notes.install(cx);
+            dispatch_history.install(cx);
             agent_skill.install_global(cx);
             keychain_grants.install(cx);
             // Only the user's own app answers agents; native test modes stay private.
@@ -312,8 +343,9 @@ pub(crate) fn run() -> std::process::ExitCode {
             match opened {
                 Ok(_window) => {
                     if mode == LaunchMode::Normal {
+                        let sound = shared_sound(cx);
                         let _ = _window.update(cx, |view, _, _| {
-                            view.sound = crate::sound::Service::new();
+                            view.sound = sound;
                         });
                         for _ in 1..window_count {
                             open_additional_window(target.clone(), cx);

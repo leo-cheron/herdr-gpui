@@ -1,33 +1,16 @@
 use super::*;
-use crate::config::{ClipboardToastPosition as ClipboardPosition, Theme, preferences::Preference};
+use crate::config::{ClipboardToastPosition as ClipboardPosition, preferences::Preference};
 use herdr_client::protocol::ToastHerdrPosition as Position;
-
-fn switch_colors(theme: &Theme, checked: bool) -> (u32, u32) {
-    let track = if checked {
-        theme.primary()
-    } else {
-        theme.active
-    };
-    let thumb = if crate::contrast::ratio(theme.background, track)
-        >= crate::contrast::ratio(theme.foreground, track)
-    {
-        theme.background
-    } else {
-        theme.foreground
-    };
-    let thumb = crate::contrast::ink(thumb, &[track], theme.contrast.mark_ratio());
-    (track, thumb)
-}
 
 #[cfg(test)]
 #[derive(Clone)]
 pub(super) struct PreferenceIo {
-    write: std::sync::Arc<dyn Fn(Preference) -> crate::Result<()> + Send + Sync>,
-    load: fn() -> crate::Result<super::super::Loaded>,
+    pub(super) write: std::sync::Arc<dyn Fn(Preference) -> crate::Result<()> + Send + Sync>,
+    pub(super) load: fn() -> crate::Result<super::super::Loaded>,
 }
 
 impl SettingsWindow {
-    fn save_preference(&mut self, edit: Preference, cx: &mut Context<Self>) {
+    pub(super) fn save_preference(&mut self, edit: Preference, cx: &mut Context<Self>) {
         #[cfg(test)]
         if let Some(io) = self.controls.preference_io.clone() {
             self.save_with(move || (io.write)(edit), io.load, false, cx);
@@ -53,7 +36,6 @@ impl SettingsWindow {
         checked: bool,
         enabled: bool,
     ) -> Stateful<Div> {
-        let (track, thumb) = switch_colors(&self.theme, checked);
         let id = id.into();
         div()
             .id(ElementId::Name(id.clone()))
@@ -66,22 +48,10 @@ impl SettingsWindow {
             .when(enabled, |row| row.cursor_pointer())
             .when(!enabled, |row| row.opacity(0.5))
             .child(label.into())
-            .child(
-                div()
-                    .w(px(36.))
-                    .h(px(22.))
-                    .flex_none()
-                    .rounded_full()
-                    .p(px(3.))
-                    .flex()
-                    .items_center()
-                    .bg(rgb(track))
-                    .when(checked, |track| track.justify_end())
-                    .child(div().size(px(16.)).rounded_full().bg(rgb(thumb))),
-            )
+            .child(crate::toggles::switch(&self.theme, 22., checked))
     }
 
-    pub(super) fn preference_switch(
+    pub(in crate::settings_window) fn preference_switch(
         &self,
         id: &'static str,
         label: &'static str,
@@ -89,12 +59,8 @@ impl SettingsWindow {
         edit: Preference,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        self.control_switch(id, label, checked, !self.busy())
-            .when(!self.busy(), |row| {
-                row.on_click(cx.listener(move |this, _, _, cx| {
-                    this.save_preference(edit, cx);
-                }))
-            })
+        self.control_switch(id, label, checked, true)
+            .on_click(cx.listener(move |this, _, _, cx| this.save_preference(edit, cx)))
     }
 
     fn preference_choice(
@@ -105,12 +71,8 @@ impl SettingsWindow {
         edit: Preference,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        self.control_choice(id, label.into(), selected, !self.busy())
-            .when(!self.busy(), |row| {
-                row.on_click(cx.listener(move |this, _, _, cx| {
-                    this.save_preference(edit, cx);
-                }))
-            })
+        self.control_choice(id, label.into(), selected, true)
+            .on_click(cx.listener(move |this, _, _, cx| this.save_preference(edit, cx)))
     }
 
     pub(super) fn native_notification_controls(&self, cx: &mut Context<Self>) -> Div {
@@ -221,38 +183,6 @@ mod tests {
     use super::*;
     use core::prelude::v1::test;
     use std::sync::{Arc, Mutex};
-
-    #[test]
-    fn switch_colors_follow_primary_and_contrast_in_every_theme() {
-        use crate::contrast::{Contrast, luminance, ratio};
-
-        for &name in Theme::BUILTIN_NAMES {
-            for contrast in [Contrast::Standard, Contrast::High] {
-                let mut theme = Theme::builtin(name).unwrap().with_contrast(contrast);
-                for checked in [false, true] {
-                    let (track, thumb) = switch_colors(&theme, checked);
-                    assert_eq!(
-                        track,
-                        if checked {
-                            theme.primary()
-                        } else {
-                            theme.active
-                        }
-                    );
-                    assert!(
-                        ratio(thumb, track) >= contrast.mark_ratio(),
-                        "{name} {contrast:?} checked={checked}: {thumb:06x} on {track:06x}"
-                    );
-                }
-                // Shared/custom themes can use a dark purple accent even on light chrome.
-                theme.palette[5] = 0x8839ef;
-                let (track, thumb) = switch_colors(&theme, true);
-                assert_eq!(track, 0x8839ef);
-                assert!(luminance(thumb) > luminance(track));
-                assert!(ratio(thumb, track) >= contrast.mark_ratio());
-            }
-        }
-    }
 
     #[gpui::test]
     fn switches_route_typed_edits_and_preserve_layout_drafts(cx: &mut TestAppContext) {

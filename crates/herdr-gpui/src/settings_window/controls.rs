@@ -1,6 +1,9 @@
 //! Prepared controls for the standalone window; persistence belongs to its serial save path.
+pub(super) mod code;
 mod fonts;
+pub(super) mod plugins;
 mod preferences;
+mod status_bar;
 
 use super::{Section, SettingsWindow, remote_history::HostState};
 use crate::{
@@ -147,11 +150,13 @@ impl SettingsWindow {
         }
         self.controls.initialized = true;
         let text_system = cx.text_system().clone();
+        let installed = self.installed_fonts.clone();
         let discovery = cx.background_executor().spawn(async move {
-            let mut names: Vec<_> = text_system
-                .all_font_names()
-                .into_iter()
+            let mut names: Vec<_> = installed
+                .get_or_init(|| text_system.all_font_names())
+                .iter()
                 .filter(|name| !name.trim().is_empty())
+                .cloned()
                 .collect();
             names.sort_by_cached_key(|name| (name.to_lowercase(), name.clone()));
             names.dedup();
@@ -175,6 +180,7 @@ impl SettingsWindow {
         if !self.busy() {
             self.controls.saving_sizes.clear();
             self.flush_control_sizes(cx);
+            self.flush_code_url(cx);
         }
     }
 
@@ -185,11 +191,14 @@ impl SettingsWindow {
         self.controls.search.update(cx, |input, cx| {
             input.set_appearance(self.config.ui.clone(), self.theme.clone(), cx);
         });
+        self.plugins
+            .refresh_appearance(&self.config, &self.theme, cx);
         if let Some(editor) = &self.controls.size_editor {
             editor.input.update(cx, |input, cx| {
                 input.set_appearance(self.config.ui.clone(), self.theme.clone(), cx);
             });
         }
+        self.refresh_code_appearance(cx);
     }
 
     fn flush_control_sizes(&mut self, cx: &mut Context<Self>) {
@@ -322,7 +331,7 @@ impl SettingsWindow {
         }
     }
 
-    fn control_card(&self, title: &'static str) -> Div {
+    pub(super) fn control_card(&self, title: &'static str) -> Div {
         div()
             .flex()
             .flex_col()
@@ -336,7 +345,7 @@ impl SettingsWindow {
             .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
     }
 
-    fn control_note(&self, text: impl Into<SharedString>) -> Div {
+    pub(super) fn control_note(&self, text: impl Into<SharedString>) -> Div {
         div()
             .min_w_0()
             .text_color(rgb(self.theme.muted))
@@ -386,8 +395,11 @@ impl SettingsWindow {
             .child(label)
     }
 
-    fn controls_shared_ready(&self) -> bool {
-        cfg!(unix) && self.shared.is_some() && !self.busy() && self.error.is_none()
+    /// Whether Herdr's shared settings can be edited at all. Busy is not part
+    /// of it: saves and loads refuse overlapping work themselves, and a control
+    /// that changes look for their few milliseconds flickers.
+    pub(super) fn controls_shared_ready(&self) -> bool {
+        cfg!(unix) && self.shared.is_some() && self.error.is_none()
     }
 
     pub(super) fn render_controls(&self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
@@ -396,8 +408,11 @@ impl SettingsWindow {
             Section::Indicators => self.render_indicator_controls(cx),
             Section::Sound => self.render_sound_controls(cx),
             Section::Notifications => self.render_notification_controls(cx),
+            Section::StatusBar => self.render_status_bar_controls(cx),
             Section::General => self.render_general_controls(cx),
-            Section::Appearance | Section::Integrations => div(),
+            Section::Appearance | Section::Integrations | Section::Plugins | Section::Code => div(),
+            #[cfg(feature = "cloud")]
+            Section::CloudDevices => div(),
         };
         div()
             .flex()
@@ -619,7 +634,7 @@ impl SettingsWindow {
                 }
                 Ok(())
             },
-            Self::loader(cx),
+            self.loader(cx),
             cx,
         );
     }
@@ -658,38 +673,14 @@ impl SettingsWindow {
         self.control_card("Browser skill")
             .child(self.control_row("Status", if installed { "Installed, kept up to date" } else { "Not installed" }))
             .child(self.control_note("Teaches local agents to use browser tabs and page notes. Installs in existing ~/.claude and ~/.agents directories; removal deletes only app-managed copies."))
-            .child(self.control_choice(id, label, false, !self.busy())
+            .child(self.control_choice(id, label, false, true)
                 .debug_selector(move || id.into())
-                .when(!self.busy(), |button| button.on_click(cx.listener(move |this, _, _, cx| this.save_skill(choice, cx)))))
+                .on_click(cx.listener(move |this, _, _, cx| this.save_skill(choice, cx))))
     }
 
     fn render_general_controls(&self, cx: &mut Context<Self>) -> Div {
-        let ready = !self.busy();
         let general = self
             .control_card("Interface")
-            .child(
-                self.control_switch(
-                    "settings-usage",
-                    "Show usage",
-                    self.config.usage.show,
-                    ready,
-                )
-                .when(ready, |button| {
-                    button.on_click(cx.listener(|this, _, _, cx| {
-                        let show = !this.config.usage.show;
-                        this.save_native(move || Config::save_usage_visibility(show), cx);
-                    }))
-                }),
-            )
-            .child(self.preference_switch(
-                "settings-system-load",
-                "Show CPU and memory",
-                self.config.show_system_load,
-                crate::config::preferences::Preference::ShowSystemLoad(
-                    !self.config.show_system_load,
-                ),
-                cx,
-            ))
             .child(self.preference_switch(
                 "settings-agent-checkpoints",
                 "Checkpoint agent turns",
@@ -736,10 +727,8 @@ impl SettingsWindow {
                 .child(div().min_w_0().child(self.controls.local_path.clone()))
                 .child(self.control_note("Shared Herdr configuration"))
                 .child(div().min_w_0().child(self.shared.as_ref().map(|shared| shared.path.display().to_string()).unwrap_or_else(|| "Unavailable".into())))
-                .child(self.control_choice("settings-reload", "Reload configuration", false, ready)
-                    .when(ready, |button| button.on_click(cx.listener(|this, _, _, cx| {
-                        this.reload(cx);
-                    }))))
+                .child(self.control_choice("settings-reload", "Reload configuration", false, true)
+                    .on_click(cx.listener(|this, _, _, cx| this.reload(cx))))
                 .child(self.control_note("Saved file edits reload automatically. Reloading GUI settings does not reload the daemon.")))
     }
 
@@ -964,7 +953,7 @@ impl SettingsWindow {
             .debug_selector(|| "settings-sidebar-layout".into())
             .map(|card| {
                 #[cfg(all(feature = "integration-test", target_os = "macos"))]
-                let card = card.child(super::native::probe(7));
+                let card = card.child(super::native::probe(super::native::SIDEBAR_LAYOUT));
                 card
             })
             .child(chooser)
@@ -973,15 +962,13 @@ impl SettingsWindow {
                     "settings-show-agents",
                     "Show agents",
                     self.config.show_agents,
-                    !self.busy(),
+                    true,
                 )
                 .debug_selector(|| "settings-show-agents".into())
-                .when(!self.busy(), |button| {
-                    button.on_click(cx.listener(|this, _, _, cx| {
-                        let show = !this.config.show_agents;
-                        this.save_native(move || Config::save_show_agents(show), cx);
-                    }))
-                }),
+                .on_click(cx.listener(|this, _, _, cx| {
+                    let show = !this.config.show_agents;
+                    this.save_native(move || Config::save_show_agents(show), cx);
+                })),
             )
             .child(self.sidebar_gap_control(cx))
     }

@@ -10,6 +10,7 @@ fn refusal_outlives_its_disconnect_and_clears_on_the_next_welcome() {
     state.apply(ClientEvent::VersionMismatch(mismatch.clone()));
     state.apply(ClientEvent::Disconnected {
         reason: "Herdr server 0.8.2 is too old".into(),
+        ssh: None,
     });
     assert_eq!(state.version_mismatch, Some(mismatch));
     assert_eq!(state.status, ConnectionStatus::Disconnected);

@@ -338,7 +338,10 @@ impl Sessions {
                     }
                     // A failed scan keeps the last list: names that were right a
                     // moment ago beat an empty popup.
-                    Err(error) => self.error = Some(error.to_string()),
+                    Err(error) => {
+                        crate::storage_warning::warn_storage_failure("Session scan", &error);
+                        self.error = Some(error.to_string());
+                    }
                 }
                 changed = true;
             }

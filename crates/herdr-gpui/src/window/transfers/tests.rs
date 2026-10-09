@@ -139,7 +139,7 @@ impl Peer {
                 .unwrap()
             {
                 ClientEvent::Snapshot(_) => break,
-                ClientEvent::Disconnected { reason } => {
+                ClientEvent::Disconnected { reason, .. } => {
                     panic!("mock peer disconnected: {reason}")
                 }
                 _ => {}
@@ -197,14 +197,15 @@ impl Peer {
         }
     }
 
-    pub(crate) fn prepare(&self, view: &mut HerdrWindow) {
+    pub(crate) fn prepare(&self, view: &mut HerdrWindow, cx: &mut Context<HerdrWindow>) {
         // Only the fixture's explicit nonexistent local socket is used to
         // initialize endpoint lifecycle flags. Replace its handle before
         // marking the synthetic projection as SSH; never reconnect to HOST.
-        view.reconnect();
-        if let Some(handle) = view.endpoints[0].connection.handle.take() {
-            handle.disconnect();
-        }
+        view.reconnect(cx);
+        // Retire that attempt as Endpoint::stop does: its connector and event
+        // reader keep the old inbox, so their late failure cannot hold or
+        // overwrite the one tests drive, as a plain disconnect would allow.
+        view.endpoints[0].connection.detach(false);
         view.endpoints[0].connection.handle = Some(self.client.handle.clone());
         view.endpoints[0].connection.target = ConnectTarget::Ssh {
             target: HOST.into(),

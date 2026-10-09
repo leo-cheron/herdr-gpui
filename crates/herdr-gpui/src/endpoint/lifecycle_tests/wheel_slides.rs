@@ -18,7 +18,7 @@ fn wheel_deltas_accumulate_into_lines_while_images_hold_the_grid(cx: &mut gpui::
         let (endpoint, mut server) = connected_endpoint("ssh:wheel");
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
-                prepare_mouse(view, endpoint);
+                prepare_mouse(view, endpoint, cx);
                 let surface = Arc::make_mut(view.live.surface.as_mut().unwrap());
                 let pane = &mut surface.panes[0];
                 pane.mouse_reporting = false;

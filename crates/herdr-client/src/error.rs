@@ -168,6 +168,9 @@ pub enum Error {
     SshTimeout,
     #[error("SSH bridge closed; check host trust, authentication, and remote Herdr installation")]
     SshClosed,
+    /// `ssh` closed the bridge before it was ready, for the reason classified.
+    #[error("SSH bridge closed: {0}")]
+    SshRefused(#[source] crate::SshFailure),
     /// Every Herdr installed on the SSH host or WSL distribution was skipped
     /// as unable to serve this client. Fields describe the first one;
     /// `version` is bounded text.
@@ -362,6 +365,16 @@ impl Error {
             Self::SocketClosed | Self::SshClosed | Self::WslClosed | Self::ClosedBeforeWelcome => {
                 io::ErrorKind::UnexpectedEof
             }
+            Self::SshRefused(failure) => match failure {
+                crate::SshFailure::HostKey | crate::SshFailure::Auth => {
+                    io::ErrorKind::PermissionDenied
+                }
+                crate::SshFailure::Unreachable
+                | crate::SshFailure::NoRoute
+                | crate::SshFailure::LocalNetworkDenied => io::ErrorKind::NotConnected,
+                crate::SshFailure::HerdrMissing => io::ErrorKind::NotFound,
+                crate::SshFailure::Other => io::ErrorKind::UnexpectedEof,
+            },
             Self::ForwardSpawn(error)
             | Self::ForwardLocalPort(error)
             | Self::ForwardControl(error) => error.kind(),

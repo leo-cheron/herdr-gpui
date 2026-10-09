@@ -1,15 +1,14 @@
 //! Switching a review between uncommitted changes and the whole branch.
-use super::{State, changes, note, the, window};
+use super::{State, changes, line, note, the, window};
 use crate::review::diff::Scope;
-use std::sync::Arc;
 
 #[gpui::test]
 fn switching_scope_reloads_and_keeps_queued_notes(cx: &mut gpui::TestAppContext) {
     let (view, cx) = window(cx, None);
     cx.update(|window, cx| view.update(cx, |view, cx| view.seed_review(changes(), window, cx)));
     // The removed line, then the added one below it.
-    note(&view, cx, 3, "Why remove this?");
-    note(&view, cx, 4, "Implement this");
+    note(&view, cx, line(2), "Why remove this?");
+    note(&view, cx, line(3), "Implement this");
     cx.update(|window, cx| crate::sidebar::layout_tests::full_draw(window, cx).clear(cx));
     let switched = cx.update(|window, cx| {
         let switched = view.update(cx, |view, cx| {
@@ -41,10 +40,10 @@ fn switching_scope_reloads_and_keeps_queued_notes(cx: &mut gpui::TestAppContext)
             branch.diff.before = "origin/main at 1a2b3c4".into();
             let review = view.reviews.values_mut().next().unwrap();
             let request = review.request;
-            review.state = State::Loaded(Arc::new(branch));
+            review.state = State::Loaded(branch);
             review.refresh_marks();
-            assert_eq!(review.marks.get(&3), None);
-            assert_eq!(review.marks.get(&4), Some(&2));
+            assert_eq!(review.marks.get(&line(2)), None);
+            assert_eq!(review.marks.get(&line(3)), Some(&2));
             assert_eq!(review.request, request);
         });
     });

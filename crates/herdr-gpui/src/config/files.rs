@@ -27,8 +27,14 @@ impl Config {
             .create(true)
             .truncate(false)
             .open(&lock_path)
+            .inspect_err(|error| {
+                tracing::warn!(operation = "config_lock_open", kind = ?error.kind(), raw_os_error = ?error.raw_os_error(), "Config lock failed");
+            })
             .map_err(|error| Error::from(error).at_path(&lock_path))?;
         lock.lock()
+            .inspect_err(|error| {
+                tracing::warn!(operation = "config_lock_acquire", kind = ?error.kind(), raw_os_error = ?error.raw_os_error(), "Config lock failed");
+            })
             .map_err(|error| Error::from(error).at_path(&lock_path))?;
         let local = path.with_extension("local.toml");
         let original = match fs::read_to_string(path) {
@@ -187,6 +193,55 @@ impl Config {
                 *value.decor_mut() = previous.decor().clone();
             }
             usage.insert("show", toml_edit::Item::Value(value));
+            write_config(path, &document.to_string())
+        })();
+        result.map_err(|error| error.at_path(path))
+    }
+
+    /// Persist the VS Code server's address, or remove it with `None`,
+    /// keeping the rest of the local file.
+    pub(crate) fn save_code_url(url: Option<crate::browser::WebUrl>) -> Result<()> {
+        let (_lock, local) = Self::prepare_files(&Self::path()?)?;
+        Self::save_code_url_path(url.as_ref(), &local)
+    }
+
+    pub(super) fn save_code_url_path(
+        url: Option<&crate::browser::WebUrl>,
+        path: &Path,
+    ) -> Result<()> {
+        let result = (|| -> Result<()> {
+            let text = match fs::read_to_string(path) {
+                Ok(text) => text,
+                Err(error) if error.kind() == ErrorKind::NotFound => LOCAL_CONFIG.into(),
+                Err(error) => return Err(error.into()),
+            };
+            let mut document = text.parse::<toml_edit::DocumentMut>()?;
+            match url {
+                Some(url) => {
+                    let code = document
+                        .entry("code")
+                        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+                        .as_table_like_mut()
+                        .ok_or(Error::InvalidCodeTable)?;
+                    let mut value = toml_edit::Value::from(url.as_str());
+                    if let Some(previous) = code.get("url").and_then(toml_edit::Item::as_value) {
+                        *value.decor_mut() = previous.decor().clone();
+                    }
+                    code.insert("url", toml_edit::Item::Value(value));
+                }
+                None => {
+                    let Some(code) = document
+                        .get_mut("code")
+                        .and_then(toml_edit::Item::as_table_like_mut)
+                    else {
+                        return Ok(());
+                    };
+                    code.remove("url");
+                    if code.is_empty() {
+                        document.remove("code");
+                    }
+                }
+            }
             write_config(path, &document.to_string())
         })();
         result.map_err(|error| error.at_path(path))
@@ -401,7 +456,10 @@ impl Config {
 
 pub(super) fn write_config(path: &Path, text: &str) -> Result<()> {
     let result = (|| -> std::io::Result<()> {
-        let parent = path
+        // rename(2) replaces a symlink instead of writing through it, so write
+        // to the file the link points at. A missing path keeps its own name.
+        let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let parent = target
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
@@ -409,7 +467,7 @@ pub(super) fn write_config(path: &Path, text: &str) -> Result<()> {
         let mut file = tempfile::NamedTempFile::new_in(parent)?;
         file.write_all(text.as_bytes())?;
         file.as_file().sync_all()?;
-        file.persist(path).map_err(|error| error.error)?;
+        file.persist(&target).map_err(|error| error.error)?;
         Ok(())
     })();
     result.map_err(|error| Error::from(error).at_path(path))

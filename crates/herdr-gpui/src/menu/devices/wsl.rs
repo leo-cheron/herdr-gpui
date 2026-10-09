@@ -259,13 +259,14 @@ impl HerdrWindow {
                             .py(px(6.))
                             .rounded(px(crate::config::corners::CONTROL))
                             .flex()
+                            .items_center()
                             .gap(px(8.))
                             .when(checked, |row| row.bg(rgb(theme.active)))
                             .when(added, |row| row.text_color(rgb(theme.muted)))
                             .when(!added, |row| {
                                 row.cursor_pointer().hover(|s| s.bg(rgb(theme.active)))
                             })
-                            .child(if checked { "●" } else { "○" })
+                            .child(crate::toggles::radio(theme, self.config.ui.size + 2., checked))
                             .child(div().flex_1().truncate().child(distro.clone()))
                             .when(added, |row| row.child("Added"))
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -402,6 +403,7 @@ impl HerdrWindow {
             let result = background.await;
             let _ = this.update(cx, |this, cx| {
                 if let Err(error) = result {
+                    crate::storage_warning::warn_storage_failure("Remove WSL device", &error);
                     this.menu.removing_devices.remove(&id);
                     this.local_error = Some(format!("Remove {distro}: {error}"));
                     cx.notify();
@@ -471,7 +473,10 @@ fn add(distro: &str, session: &str) -> Outcome {
         Ok(HostProbe::Running | HostProbe::Stopped) => {
             match herdr_client::add_wsl_host(false, distro, session) {
                 Ok(()) => Outcome::Saved,
-                Err(error) => Outcome::Refused(format!("Save {distro}: {error}")),
+                Err(error) => {
+                    crate::storage_warning::warn_storage_failure("Save WSL device", &error);
+                    Outcome::Refused(format!("Save {distro}: {error}"))
+                }
             }
         }
         Ok(HostProbe::Missing) => Outcome::Refused(format!(
@@ -480,7 +485,7 @@ fn add(distro: &str, session: &str) -> Outcome {
         Ok(HostProbe::Outdated) => Outcome::Refused(format!(
             "The Herdr in {distro} is too old for this app. Update it inside the distribution, then add it again."
         )),
-        Ok(HostProbe::SshFailed) => Outcome::Refused(format!("{distro} did not answer.")),
+        Ok(HostProbe::SshFailed(_)) => Outcome::Refused(format!("{distro} did not answer.")),
         Err(error) => Outcome::Refused(format!("Check {distro}: {error}")),
     }
 }

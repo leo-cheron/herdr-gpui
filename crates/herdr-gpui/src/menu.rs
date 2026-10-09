@@ -21,6 +21,7 @@ mod version_mismatch;
 mod whats_new;
 mod workspace;
 mod workspace_close;
+mod worktree_note;
 mod worktree_open;
 mod worktree_render;
 mod worktree_source;

@@ -165,7 +165,7 @@ fn connection_reports_the_mismatch_before_disconnecting() {
             server_version: None
         })
     ));
-    let ClientEvent::Disconnected { reason } = event(&client) else {
+    let ClientEvent::Disconnected { reason, .. } = event(&client) else {
         panic!("expected disconnect")
     };
     assert!(

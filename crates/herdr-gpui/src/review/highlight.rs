@@ -1,11 +1,13 @@
-//! Syntax colouring for a review's diff, worked out with the diff in the
-//! background so drawing only applies prepared spans. Each file's grammar
-//! follows its name. Removed lines are read in the order the old file had
-//! them and added lines in the new file's, unchanged lines in both; every hunk
-//! starts afresh, since the lines between hunks are not in the diff. Tokens
-//! are classified, not coloured: the window colours each class from its own
+//! Syntax colouring for a review's diff, worked out in the background a hunk
+//! at a time as hunks come into view, so drawing only applies prepared spans
+//! and a huge change is never coloured whole. Each file's grammar follows
+//! its name. Removed lines are read in the order the old file had them and
+//! added lines in the new file's, unchanged lines in both; every hunk starts
+//! afresh, since the lines between hunks are not in the diff. Tokens are
+//! classified, not coloured: the window colours each class from its own
 //! theme, so a theme change recolours the diff.
-use super::diff::{Diff, Kind};
+use super::diff::{Kind, Lines};
+use std::ops::Range;
 use std::sync::OnceLock;
 use syntect::parsing::{ParseState, Scope, ScopeStack, ScopeStackOp, SyntaxReference, SyntaxSet};
 
@@ -28,6 +30,12 @@ pub(crate) struct Span {
     pub end: usize,
     pub token: Token,
 }
+
+/// Bytes of a line coloured; the rest of a very long line stays plain.
+const MAX_COLOURED_BYTES: usize = 2_000;
+/// Lines of its hunk read before a stretch, unshown, so a string or
+/// comment open across the seam colours right.
+const WARM_UP: usize = 200;
 
 /// The bundled grammars, loaded once, on the first diff that needs them.
 fn syntaxes() -> &'static SyntaxSet {
@@ -102,6 +110,11 @@ impl Side {
     /// The spans of `text`, the next line on this side. A line Git or the
     /// grammar cannot follow just goes uncoloured.
     fn line(&mut self, text: &str) -> Vec<Span> {
+        let mut end = text.len().min(MAX_COLOURED_BYTES);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let text = &text[..end];
         let line = format!("{text}\n");
         let Ok(ops) = self.state.parse_line(&line, syntaxes()) else {
             return Vec::new();
@@ -143,40 +156,49 @@ fn grammar(name: &str) -> Option<&'static SyntaxReference> {
     syntaxes().find_syntax_by_extension(extension)
 }
 
-/// Colours `diff` in place. Blocking, and seconds for the largest diffs, so
-/// it runs on the background executor after the plain diff is shown.
-pub(crate) fn colour(diff: &mut Diff) {
-    let mut file = usize::MAX;
-    let mut syntax = None;
-    let mut sides: Option<(Side, Side)> = None;
-    for index in 0..diff.rows.len() {
-        let row = &diff.rows[index];
-        if row.file != file {
-            file = row.file;
-            syntax = diff.files.get(file).and_then(|name| grammar(name));
-            sides = None;
-        }
-        let Some(syntax) = syntax else {
-            continue;
+/// The spans of each line of `lines` in `range`, a stretch of one hunk,
+/// for a file named `name`. Blocking: it runs on the background executor.
+pub(crate) fn colour(name: &str, lines: &Lines, range: Range<usize>) -> Vec<Vec<Span>> {
+    let Some(syntax) = grammar(name) else {
+        return vec![Vec::new(); range.len()];
+    };
+    let (mut old, mut new) = (Side::new(syntax), Side::new(syntax));
+    let mut read = |index: usize| {
+        let Some(line) = lines.get(index) else {
+            return Vec::new();
         };
-        let (old, new) = sides.get_or_insert_with(|| (Side::new(syntax), Side::new(syntax)));
-        let spans = match row.kind {
-            // The lines between hunks are not in the diff: start afresh.
-            Kind::Hunk => {
-                *old = Side::new(syntax);
-                *new = Side::new(syntax);
-                continue;
-            }
-            Kind::Added => new.line(&row.text),
-            Kind::Removed => old.line(&row.text),
+        let text = lines.text_of(line);
+        match line.kind {
+            Kind::Added => new.line(text),
+            Kind::Removed => old.line(text),
             Kind::Context => {
-                old.line(&row.text);
-                new.line(&row.text)
+                old.line(text);
+                new.line(text)
             }
-            Kind::File | Kind::Meta => continue,
-        };
-        diff.rows[index].spans = spans;
+            Kind::Hunk | Kind::Meta => Vec::new(),
+        }
+    };
+    let warm = lines
+        .hunk_start(range.start)
+        .max(range.start.saturating_sub(WARM_UP));
+    for index in warm..range.start {
+        read(index);
     }
+    range.map(read).collect()
+}
+
+/// The spans of each of the first `limit` lines of `text`, a whole file
+/// named `name`, read top to bottom. Blocking: it runs on the background
+/// executor.
+pub(crate) fn colour_file(name: &str, text: &str, limit: usize) -> Vec<Vec<Span>> {
+    let Some(syntax) = grammar(name) else {
+        return Vec::new();
+    };
+    let mut side = Side::new(syntax);
+    text.lines()
+        .take(limit)
+        .map(|line| side.line(line))
+        .collect()
 }
 
 #[cfg(test)]

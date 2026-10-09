@@ -20,18 +20,28 @@ use std::sync::Arc;
 
 #[cfg(test)]
 mod agent_rows;
+#[cfg(all(test, feature = "coder"))]
+mod coder_dialog;
 #[cfg(test)]
 mod configured_rows;
 #[cfg(test)]
 mod device_footer;
 #[cfg(test)]
+mod host_agents;
+#[cfg(test)]
 mod host_groups;
+#[cfg(test)]
+mod host_nesting;
+#[cfg(test)]
+mod host_wash;
 #[cfg(test)]
 mod layouts;
 #[cfg(test)]
 mod listening_ports;
 #[cfg(test)]
 mod palette;
+#[cfg(test)]
+mod picker_scroll;
 #[cfg(test)]
 mod preferences_panel;
 #[cfg(test)]
@@ -43,15 +53,23 @@ mod selection_scroll;
 #[cfg(test)]
 mod sidebar_cache;
 #[cfg(test)]
+mod spacing_overrides;
+#[cfg(test)]
 mod split_pane;
 #[cfg(test)]
 mod status_bar;
+#[cfg(test)]
+mod sticky_hosts;
+#[cfg(test)]
+mod superset_dots;
 #[cfg(test)]
 mod text_width;
 #[cfg(test)]
 mod update_panel;
 #[cfg(test)]
 mod workspace_menu;
+#[cfg(test)]
+mod worktree_notes;
 #[cfg(test)]
 mod worktree_rows;
 
@@ -408,17 +426,23 @@ pub(crate) fn fixture_window(window: &mut Window, cx: &mut Context<HerdrWindow>)
         daemon_text: Default::default(),
         removal: None,
         worktree_script: None,
+        editor_open: None,
+        editor_panes: Vec::new(),
         teleport: None,
         teleport_marks: crate::teleport::Marks::detached(),
         teleport_follow: None,
+        dispatch_job: None,
+        dispatch_setups: Default::default(),
         fan_out: None,
         selection: None,
         selection_follow: Default::default(),
         find: None,
         copy_mode: None,
+        find_memory: Default::default(),
         flash: None,
         configured_terminal_size: crate::config::Config::default().terminal.size,
         gui_config_diagnostic: Default::default(),
+        icon_font_notice: Default::default(),
         // Keep the original geometry fixture explicit; density-switching tests
         // above exercise all three modes independently of the default.
         config: crate::config::Config {
@@ -429,6 +453,7 @@ pub(crate) fn fixture_window(window: &mut Window, cx: &mut Context<HerdrWindow>)
             ..Default::default()
         },
         theme: Default::default(),
+        theme_light: crate::app::light_appearance(cx),
         config_load: None,
         font_size_saves: Default::default(),
         config_watch: None,
@@ -437,17 +462,23 @@ pub(crate) fn fixture_window(window: &mut Window, cx: &mut Context<HerdrWindow>)
         deliveries: Default::default(),
         notes_width: crate::panel_resize::NOTES,
         review_files_width: crate::panel_resize::REVIEW_FILES,
+        code_width: crate::panel_resize::CODE,
         reviews: Default::default(),
+        code_views: Default::default(),
+        code_indexes: Default::default(),
         viewport_width: 0.,
         pr_actions: Default::default(),
         usage: Default::default(),
         system_load: Default::default(),
         checkpoints: Default::default(),
         port_forwards: Default::default(),
+        #[cfg(feature = "cloud")]
+        cloud_jobs: Default::default(),
         listening_ports: Default::default(),
         tunnels: Default::default(),
         sidebar_visible: true,
         sidebar_start_pending: true,
+        status_bar_visible: true,
         device_filter: None,
         endpoints: vec![crate::endpoint::Endpoint::new(
             crate::endpoint::LOCAL.into(),
@@ -494,9 +525,14 @@ pub(crate) fn fixture_window(window: &mut Window, cx: &mut Context<HerdrWindow>)
         held_keys: Default::default(),
         file_transfer: None,
         presentation: Default::default(),
+        wake: crate::endpoint::WakeClock::new(
+            std::time::Instant::now(),
+            std::time::SystemTime::now(),
+        ),
         painter: Default::default(),
         regions: Vec::new(),
         marked: String::new(),
+        marked_selection: None,
         hover: None,
         hover_menu: None,
         local_error: None,
@@ -522,6 +558,7 @@ pub(crate) fn fixture_window(window: &mut Window, cx: &mut Context<HerdrWindow>)
         input_probe: crate::smoke::InputProbe::default(),
         sidebar_scroll: Default::default(),
         sidebar_revealed: Default::default(),
+        sidebar_pin_reveal: Default::default(),
         _poll: Task::ready(()),
         _activation: cx.observe_window_activation(window, |_, _, _| {}),
         _appearance: cx.observe_window_appearance(window, |this, _, cx| {
@@ -542,6 +579,7 @@ pub(crate) fn fixture_window(window: &mut Window, cx: &mut Context<HerdrWindow>)
         _host_theme: HerdrWindow::observe_host_theme(cx),
         browser: crate::browser::Browser::new(cx),
         _browser_tabs: cx.observe_global::<crate::browser::Store>(|_, cx| cx.notify()),
+        _worktree_notes: HerdrWindow::observe_worktree_notes(window, cx),
         prefix_armed: false,
         resize_mode: false,
         server_keys: None,

@@ -3,18 +3,22 @@
 
 mod agents;
 mod cell;
+mod host_row;
 mod hover;
 mod layout;
 mod layouts;
 mod metrics;
+mod note_line;
 mod order;
 pub(crate) mod preview;
 mod rail;
 mod render;
 mod reorder;
 mod row;
+mod sticky;
 mod tokens;
 mod view;
+mod wash;
 mod workspaces;
 
 #[cfg(test)]
@@ -32,7 +36,7 @@ pub(crate) use {
     metrics::{ARROW_RESERVE, HOST_ARROW_WIDTH, HOST_GAP, ICON_RESERVE, LABEL_GAP, STATUS_WIDTH},
     rail::SidebarMode,
     reorder::WorkspaceDrag,
-    row::{compact, github_mark, label_text},
+    row::{compact, github_mark, label_text, styled as styled_token},
     view::SidebarView,
     workspaces::workspace_label,
 };
@@ -44,7 +48,7 @@ pub(crate) use metrics::LABEL_WIDTH;
 
 pub(crate) use view::cached as cached_view;
 
-use agents::{agents_sort, sorted_agents};
+use agents::agents_sort;
 use metrics::*;
 use row::{RowBadge, first_text};
 use workspaces::visible_workspace_entries;

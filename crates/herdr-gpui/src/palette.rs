@@ -9,6 +9,7 @@ use gpui::{prelude::*, *};
 use herdr_client::{
     Method,
     protocol::{ClientShellCommandAction, ClientShellSnapshot},
+    scrollback::SelectionReadParams,
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -18,10 +19,11 @@ mod go_to;
 mod interaction_tests;
 mod project_open;
 mod projects;
+pub(crate) use projects::launch_root;
 mod render;
 mod search;
 
-use go_to::{destination_exists, go_to_entries};
+use go_to::{destination_exists, go_to_entries, note_entries};
 
 #[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -59,10 +61,18 @@ pub(crate) enum Filter {
     Navigation,
     Commands,
     Projects,
+    /// Checkouts the user keeps a note on.
+    Notes,
 }
 
 impl Filter {
-    const ALL: [Self; 4] = [Self::All, Self::Navigation, Self::Commands, Self::Projects];
+    const ALL: [Self; 5] = [
+        Self::All,
+        Self::Navigation,
+        Self::Commands,
+        Self::Projects,
+        Self::Notes,
+    ];
 
     fn label(self) -> &'static str {
         match self {
@@ -70,6 +80,7 @@ impl Filter {
             Self::Navigation => "Navigation",
             Self::Commands => "Commands",
             Self::Projects => "Projects",
+            Self::Notes => "Notes",
         }
     }
 
@@ -80,6 +91,7 @@ impl Filter {
                     Action::Native(_) | Action::Configured(..) => Self::Commands,
                     Action::Go { .. } => Self::Navigation,
                     Action::Project(_) => Self::Projects,
+                    Action::Note { .. } => Self::Notes,
                 }
     }
 }
@@ -95,6 +107,12 @@ enum Action {
     },
     Configured(String, ClientShellCommandAction),
     Project(projects::Project),
+    /// A workspace whose checkout has a note, gone to as Go To goes to it.
+    Note {
+        endpoint: String,
+        boot: String,
+        workspace: String,
+    },
 }
 
 struct Entry {
@@ -152,6 +170,7 @@ enum Identity {
     Go(String, OwnedNavigationTarget),
     Configured(String),
     Project(std::path::PathBuf),
+    Note(String, String),
 }
 
 impl Action {
@@ -163,6 +182,11 @@ impl Action {
             } => Identity::Go(endpoint.clone(), target.clone()),
             Self::Configured(id, _) => Identity::Configured(id.clone()),
             Self::Project(project) => Identity::Project(project.path.clone()),
+            Self::Note {
+                endpoint,
+                workspace,
+                ..
+            } => Identity::Note(endpoint.clone(), workspace.clone()),
         }
     }
 }
@@ -173,15 +197,19 @@ struct Target {
     workspace: Option<String>,
     tab: Option<String>,
     pane: Option<String>,
+    /// The focused pane's highlight when the target was captured, which a
+    /// plugin action receives as its selected text.
+    selection: Option<SelectionReadParams>,
 }
 
 impl Target {
-    fn capture(snapshot: &ClientShellSnapshot) -> Self {
+    fn capture(snapshot: &ClientShellSnapshot, selection: Option<SelectionReadParams>) -> Self {
         Self {
             boot: snapshot.boot_id.clone(),
             workspace: snapshot.focused_workspace_id.clone(),
             tab: snapshot.focused_tab_id.clone(),
             pane: snapshot.focused_pane_id.clone(),
+            selection,
         }
     }
 
@@ -247,6 +275,14 @@ impl Target {
                 params[key] = json!(value);
             }
         }
+        // Herdr reads the selection only for plugin actions, and only from
+        // the pane the command targets.
+        if action == ClientShellCommandAction::PluginAction
+            && let Some(selection) = &self.selection
+            && self.pane.as_ref() == Some(&selection.pane_id)
+        {
+            params["selection"] = serde_json::to_value(selection)?;
+        }
         Ok(params)
     }
 }
@@ -285,6 +321,8 @@ pub(super) struct Palette {
     keymap: crate::keymap::Keymap,
     supports_clear: bool,
     supports_edit_scrollback: bool,
+    /// The notes revision the entries were prepared from.
+    notes_revision: Option<u64>,
     _subscription: Subscription,
 }
 
@@ -424,11 +462,14 @@ impl HerdrWindow {
             let query = search.read(cx).text().to_owned();
             this.filter_palette(&query, cx);
         });
+        // Captured with the target, before the palette's own input could
+        // change what is highlighted.
+        let selection = self.plugin_selection();
         let target = self
             .live
             .snapshot
             .as_ref()
-            .map(|snapshot| Target::capture(snapshot));
+            .map(|snapshot| Target::capture(snapshot, selection));
         let local_target = self
             .endpoints
             .iter()
@@ -473,9 +514,10 @@ impl HerdrWindow {
             keymap: self.keymap().clone(),
             supports_clear: self.live.supports_pane_clear,
             supports_edit_scrollback: self.live.supports_edit_scrollback,
+            notes_revision: None,
             _subscription: subscription,
         };
-        self.prepare_palette_entries(&mut palette);
+        self.prepare_palette_entries(&mut palette, crate::worktree_notes::Notes::of(cx));
         self.menu.palette = Some(palette);
         self.rank_palette(Selection::Keep, cx);
         self.load_palette_projects(window, cx);
@@ -504,9 +546,16 @@ impl HerdrWindow {
 
     /// Rebuilds the entries; the caller ranks them once the palette is back
     /// in the menu.
-    fn prepare_palette_entries(&self, palette: &mut Palette) {
+    fn prepare_palette_entries(
+        &self,
+        palette: &mut Palette,
+        notes: Option<&crate::worktree_notes::Notes>,
+    ) {
         let mut entries = Vec::new();
         let sources = self.palette_sources();
+        if let Some(notes) = notes {
+            note_entries(notes, &sources, &self.endpoints, &mut entries);
+        }
         for source in &sources {
             let Some(snapshot) = source.snapshot.as_ref().filter(|_| source.enabled) else {
                 continue;
@@ -606,6 +655,7 @@ impl HerdrWindow {
         palette.keymap = self.keymap().clone();
         palette.supports_clear = self.live.supports_pane_clear;
         palette.supports_edit_scrollback = self.live.supports_edit_scrollback;
+        palette.notes_revision = notes.map(crate::worktree_notes::Notes::revision);
     }
 
     pub(crate) fn refresh_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -626,7 +676,7 @@ impl HerdrWindow {
                 palette.configuration = self.config.palette.clone();
                 palette.projects = projects::Collection::default();
                 palette.loading_projects = !self.config.palette.project_roots.is_empty();
-                self.prepare_palette_entries(&mut palette);
+                self.prepare_palette_entries(&mut palette, crate::worktree_notes::Notes::of(cx));
                 self.menu.palette = Some(palette);
                 self.rank_palette(Selection::Keep, cx);
                 self.load_palette_projects(window, cx);
@@ -635,7 +685,9 @@ impl HerdrWindow {
             return;
         }
         let sources = self.palette_sources();
-        let changed = palette.keymap != *self.keymap()
+        let notes = crate::worktree_notes::Notes::of(cx);
+        let changed = palette.notes_revision != notes.map(crate::worktree_notes::Notes::revision)
+            || palette.keymap != *self.keymap()
             || palette.supports_clear != self.live.supports_pane_clear
             || palette.supports_edit_scrollback != self.live.supports_edit_scrollback
             || sources.len() != palette.sources.len()
@@ -650,13 +702,25 @@ impl HerdrWindow {
                     }
             });
         if changed && let Some(mut palette) = self.menu.palette.take() {
-            self.prepare_palette_entries(&mut palette);
+            self.prepare_palette_entries(&mut palette, notes);
             self.menu.palette = Some(palette);
             self.rank_palette(Selection::Keep, cx);
         }
     }
 
     fn activate_palette(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
+        let action = match action {
+            Action::Note {
+                endpoint,
+                boot,
+                workspace,
+            } => Action::Go {
+                endpoint,
+                boot,
+                target: NavigationTarget::Workspace(workspace),
+            },
+            action => action,
+        };
         if self.menu.palette.as_ref().is_none_or(Palette::busy) {
             return;
         }
@@ -712,8 +776,17 @@ impl HerdrWindow {
                 .and_then(|p| p.target.as_ref())
                 .ok_or(Error::NoPaletteSession)?;
             match &action {
-                Action::Configured(id, action) => target.invocation(snapshot, id, *action),
-                Action::Native(_) | Action::Go { .. } | Action::Project(_) => unreachable!(),
+                Action::Configured(id, action) => {
+                    let mut target = target.clone();
+                    if let Some(selection) = &mut target.selection {
+                        self.fence_plugin_selection(selection);
+                    }
+                    target.invocation(snapshot, id, *action)
+                }
+                Action::Native(_)
+                | Action::Go { .. }
+                | Action::Project(_)
+                | Action::Note { .. } => unreachable!(),
             }
         })();
         match result {
@@ -751,14 +824,14 @@ impl HerdrWindow {
                 return Err(Error::PaletteConnectionNotReady);
             }
             let snapshot = self.live.snapshot.as_ref().ok_or(Error::NoSnapshot)?;
-            Target::capture(snapshot).invocation(snapshot, id, action)
+            Target::capture(snapshot, self.plugin_selection()).invocation(snapshot, id, action)
         })();
         match result {
             Ok(params) => {
                 self.request_focus_change(Method::CommandInvoke.as_str(), None, |handle, boot| {
                     handle.request(boot, Method::CommandInvoke, params)
                 });
-                self.marked.clear();
+                self.discard_composition(cx);
             }
             Err(error) => self.local_error = Some(error.to_string()),
         }

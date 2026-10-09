@@ -92,6 +92,28 @@ pub(super) fn uncommitted(theme: &crate::config::Theme, size: f32) -> gpui::Div 
         )
 }
 
+/// A checkout the user keeps a note on, beside the working-tree marker and
+/// in a hue of its own so the two never read as one.
+pub(super) fn note(theme: &crate::config::Theme, size: f32) -> gpui::Div {
+    use gpui::{div, prelude::*, px, rgb, rgba, svg};
+    div()
+        .size(px(size))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(crate::config::corners::SMALL))
+        .bg(rgba((theme.palette[4] << 8) | 0x30))
+        .border_1()
+        .border_color(rgba((theme.palette[4] << 8) | 0x90))
+        .child(
+            svg()
+                .path("icons/note.svg")
+                .size(px(size - 4.))
+                .text_color(rgb(theme.ink(theme.palette[4]))),
+        )
+}
+
 /// A checkout whose work was teleported to another host.
 pub(super) fn teleported(theme: &crate::config::Theme, size: f32) -> gpui::Div {
     use gpui::{Rgba, div, prelude::*, px, svg};
@@ -130,6 +152,8 @@ impl AssetSource for Icons {
             "icons/user.svg" => include_bytes!("../../../assets/icons/user.svg"),
             "icons/x.svg" => include_bytes!("../../../assets/icons/x.svg"),
             "icons/pencil.svg" => include_bytes!("../../../assets/icons/pencil.svg"),
+            "icons/note.svg" => include_bytes!("../../../assets/icons/note.svg"),
+            "icons/code.svg" => include_bytes!("../../../assets/icons/code.svg"),
             "icons/trash.svg" => include_bytes!("../../../assets/icons/trash.svg"),
             "icons/chevron-up.svg" => include_bytes!("../../../assets/icons/chevron-up.svg"),
             "icons/chevron-down.svg" => include_bytes!("../../../assets/icons/chevron-down.svg"),
@@ -147,8 +171,13 @@ impl AssetSource for Icons {
             "icons/play.svg" => include_bytes!("../../../assets/icons/play.svg"),
             "icons/chart.svg" => include_bytes!("../../../assets/icons/chart.svg"),
             "icons/pulse.svg" => include_bytes!("../../../assets/icons/pulse.svg"),
+            "icons/plug.svg" => include_bytes!("../../../assets/icons/plug.svg"),
             "icons/lock.svg" => include_bytes!("../../../assets/icons/lock.svg"),
             "icons/globe.svg" => include_bytes!("../../../assets/icons/globe.svg"),
+            "icons/vscode.svg" => include_bytes!("../../../assets/icons/vscode.svg"),
+            "icons/error.svg" => include_bytes!("../../../assets/icons/error.svg"),
+            "icons/pass.svg" => include_bytes!("../../../assets/icons/pass.svg"),
+            "icons/terminal.svg" => include_bytes!("../../../assets/icons/terminal.svg"),
             "icons/arrow-left.svg" => include_bytes!("../../../assets/icons/arrow-left.svg"),
             "icons/arrow-right.svg" => include_bytes!("../../../assets/icons/arrow-right.svg"),
             "icons/external.svg" => include_bytes!("../../../assets/icons/external.svg"),
@@ -158,8 +187,16 @@ impl AssetSource for Icons {
             "icons/zoom.svg" => include_bytes!("../../../assets/icons/zoom.svg"),
             "icons/diff-unified.svg" => include_bytes!("../../../assets/icons/diff-unified.svg"),
             "icons/diff-split.svg" => include_bytes!("../../../assets/icons/diff-split.svg"),
+            "icons/chevron-right.svg" => {
+                include_bytes!("../../../assets/icons/chevron-right.svg")
+            }
+            "icons/whitespace.svg" => include_bytes!("../../../assets/icons/whitespace.svg"),
+            "icons/search.svg" => include_bytes!("../../../assets/icons/search.svg"),
+            "icons/check.svg" => include_bytes!("../../../assets/icons/check.svg"),
+            "icons/copy.svg" => include_bytes!("../../../assets/icons/copy.svg"),
             "icons/panel-left.svg" => include_bytes!("../../../assets/icons/panel-left.svg"),
             "icons/panel-right.svg" => include_bytes!("../../../assets/icons/panel-right.svg"),
+            "icons/status-bar.svg" => include_bytes!("../../../assets/icons/status-bar.svg"),
             "icons/window-minimize.svg" => {
                 include_bytes!("../../../assets/icons/window-minimize.svg")
             }
@@ -203,8 +240,13 @@ impl AssetSource for Icons {
             "icons/play.svg",
             "icons/chart.svg",
             "icons/pulse.svg",
+            "icons/plug.svg",
             "icons/lock.svg",
             "icons/globe.svg",
+            "icons/vscode.svg",
+            "icons/error.svg",
+            "icons/pass.svg",
+            "icons/terminal.svg",
             "icons/arrow-left.svg",
             "icons/arrow-right.svg",
             "icons/external.svg",
@@ -214,8 +256,13 @@ impl AssetSource for Icons {
             "icons/zoom.svg",
             "icons/diff-unified.svg",
             "icons/diff-split.svg",
+            "icons/chevron-right.svg",
+            "icons/whitespace.svg",
+            "icons/search.svg",
+            "icons/check.svg",
             "icons/panel-left.svg",
             "icons/panel-right.svg",
+            "icons/status-bar.svg",
             "icons/window-minimize.svg",
             "icons/window-maximize.svg",
             "icons/window-restore.svg",
@@ -256,7 +303,7 @@ mod tests {
         assert!(Icons.load("unknown.svg").unwrap().is_none());
         assert_eq!(
             Icons.list("icons/").unwrap().len(),
-            40 + AgentIcon::ALL.len() + crate::usage::icon_paths().count()
+            50 + AgentIcon::ALL.len() + crate::usage::icon_paths().count()
         );
     }
 

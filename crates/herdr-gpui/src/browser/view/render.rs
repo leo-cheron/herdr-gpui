@@ -8,11 +8,43 @@ use crate::{
         Location, Store, Tab, TabId, WebUrl,
         groups::{GroupId, Pick, Slot},
     },
+    listening_ports::Link,
     window::Flash,
 };
 use gpui::{prelude::*, *};
 
 impl HerdrWindow {
+    /// A page, filling the space it is given. It also records where the
+    /// page draws, so a menu hides only the pages it covers; and, while one
+    /// does, it shows the page's picture in its place.
+    pub(in crate::browser) fn page_area(&self, id: TabId, page: impl IntoElement) -> Div {
+        let area = div().flex_1().min_h_0().relative().child(page);
+        #[cfg(any(target_os = "macos", windows))]
+        let area = {
+            let (picture, bounds) = (self.frozen_picture(id), self.browser.page_bounds.clone());
+            area.child(
+                canvas(
+                    move |area, _, _| {
+                        bounds.borrow_mut().insert(id, area);
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            )
+            .children(picture.map(|picture| {
+                img(picture)
+                    .debug_selector(|| "page-picture".into())
+                    .absolute()
+                    .inset_0()
+                    .size_full()
+            }))
+        };
+        #[cfg(not(any(target_os = "macos", windows)))]
+        let _ = id;
+        area
+    }
+
     /// The workspace's browser tabs, after its Herdr tabs in a group's strip.
     pub(crate) fn browser_tab_entries(
         &self,
@@ -32,15 +64,13 @@ impl HerdrWindow {
             .map(|tab| {
                 let id = tab.id;
                 let (background, text) = self.tab_colors(shown == Some(id), slot.id);
-                // A review tab shows a diff, not a page.
-                let icon = if tab
-                    .location
-                    .as_ref()
-                    .is_some_and(|location| !location.is_page())
-                {
-                    "icons/diff-unified.svg"
-                } else {
-                    "icons/globe.svg"
+                // The VS Code tab bears its mark; a review tab shows a diff
+                // and a code tab a file, not a page.
+                let icon = match tab.location {
+                    _ if tab.place.is_code() => "icons/vscode.svg",
+                    Some(Location::Review { .. }) => "icons/diff-unified.svg",
+                    Some(Location::Code { .. }) => "icons/code.svg",
+                    _ => "icons/globe.svg",
                 };
                 let tab = div()
                     .id(SharedString::from(format!("browser-tab-{id}")))
@@ -90,11 +120,7 @@ impl HerdrWindow {
                             // Split, the page closes in its group alone.
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
-                                if this.is_split() {
-                                    this.close_in_group(slot.id, vec![Pick::Page(id)], window, cx);
-                                } else {
-                                    this.close_browser_tab(id, window, cx);
-                                }
+                                this.close_strip_tab(slot.id, Pick::Page(id), window, cx);
                             })),
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -222,12 +248,7 @@ impl HerdrWindow {
         let page = self.browser.pages.page(id).cloned();
         #[cfg(not(any(target_os = "macos", windows)))]
         let page: Option<AnyView> = None;
-        let failure = self
-            .browser
-            .failed
-            .as_ref()
-            .filter(|(failed, _)| *failed == id)
-            .map(|(_, message)| message.clone());
+        let failure = self.browser.failed.get(&id).cloned();
         let placeholder: SharedString = match (&failure, loaded) {
             (Some(message), _) => format!("Could not show this page: {message}").into(),
             (None, false) => "Type an address above and press Return.".into(),
@@ -332,51 +353,30 @@ impl HerdrWindow {
                     }
                 },
             ));
-        #[cfg(any(target_os = "macos", windows))]
-        let (picture, bounds) = (self.frozen_picture(id), self.browser.page_bounds.clone());
         let content = match (page, &failure) {
-            (Some(page), None) => div()
-                .flex_1()
-                .min_h_0()
-                .relative()
-                .child(page)
-                // Where the page draws, so a menu hides only the pages it
-                // covers; and, while one does, the page's picture in its place.
-                .map(|content| {
-                    #[cfg(any(target_os = "macos", windows))]
-                    let content = content
-                        .child(
-                            canvas(
-                                move |area, _, _| {
-                                    bounds.borrow_mut().insert(id, area);
-                                },
-                                |_, _, _, _| {},
-                            )
-                            .absolute()
-                            .inset_0(),
-                        )
-                        .children(picture.map(|picture| {
-                            img(picture)
-                                .debug_selector(|| "page-picture".into())
-                                .absolute()
-                                .inset_0()
-                                .size_full()
-                        }));
-                    content
-                })
-                .into_any_element(),
+            (Some(page), None) => self.page_area(id, page).into_any_element(),
+            // The VS Code tab says, as its panel does, why its page is not
+            // there yet.
+            _ if tab.place.is_code() => self.render_code_status(failure.clone()),
             _ => div()
                 .flex_1()
                 .min_h_0()
                 .flex()
                 .items_center()
                 .justify_center()
+                .flex_col()
+                .gap(px(10.))
                 .px_4()
                 .text_color(rgb(self.theme.muted))
                 .child(
                     div()
                         .debug_selector(move || slot.selector("browser-placeholder"))
                         .child(placeholder),
+                )
+                .children(
+                    (failure.is_none() && !loaded)
+                        .then(|| self.render_blank_ports(slot, id, cx))
+                        .flatten(),
                 )
                 .into_any_element(),
         };
@@ -406,6 +406,78 @@ impl HerdrWindow {
             .into_any_element()
     }
 
+    /// The workspace's listening ports under a blank tab's prompt, each
+    /// opening its page in this tab; None while it listens on none.
+    fn render_blank_ports(&self, slot: Slot, id: TabId, cx: &mut Context<Self>) -> Option<Div> {
+        let (_, _, listed) = self.focused_listening_ports()?;
+        let theme = &self.theme;
+        let chips = listed.ports.iter().filter_map(|port| {
+            let link = port.link(listed.origin)?;
+            let selector = slot.selector(&format!("blank-port-{}", port.number));
+            Some(
+                div()
+                    .id(SharedString::from(selector.clone()))
+                    .debug_selector(move || selector.clone())
+                    .flex()
+                    .gap(px(6.))
+                    .px(px(10.))
+                    .py(px(2.))
+                    .rounded(px(crate::config::corners::CONTROL))
+                    .border_1()
+                    .border_color(rgb(theme.active))
+                    .cursor_pointer()
+                    .hover(|chip| chip.bg(rgb(theme.active)))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(rgb(theme.foreground))
+                            .child(link.label()),
+                    )
+                    // A long process name gives way; the address stays whole.
+                    .when(!port.process.is_empty(), |chip| {
+                        chip.child(div().max_w(px(160.)).truncate().child(port.process.clone()))
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_blank_port(slot.id, id, &link, window, cx);
+                    })),
+            )
+        });
+        Some(
+            div()
+                .flex()
+                .flex_wrap()
+                .justify_center()
+                .gap(px(6.))
+                .children(chips),
+        )
+    }
+
+    /// A port picked on a blank tab loads in that tab. A port behind an SSH
+    /// tunnel opens as its status bar number does, once the tunnel is up.
+    fn open_blank_port(
+        &mut self,
+        group: GroupId,
+        id: TabId,
+        link: &Link,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match link {
+            Link::Page(url) => {
+                self.visit(group, id, Location::Web { url: url.clone() }, window, cx);
+            }
+            Link::Tunnel(_) => {
+                let Some((endpoint, workspace)) = self
+                    .focused_listening_ports()
+                    .map(|(endpoint, workspace, _)| (endpoint.to_owned(), workspace.to_owned()))
+                else {
+                    return;
+                };
+                self.open_port_link(&endpoint, &workspace, link, window, cx);
+            }
+        }
+    }
+
     fn submit_address(
         &mut self,
         group: GroupId,
@@ -418,7 +490,18 @@ impl HerdrWindow {
             self.show_flash(Flash::warning("Not an http or https address"), cx);
             return;
         };
-        let location = Location::Web { url };
+        self.visit(group, id, Location::Web { url }, window, cx);
+    }
+
+    /// Loads `location` in tab `id`, shown in `group`.
+    fn visit(
+        &mut self,
+        group: GroupId,
+        id: TabId,
+        location: Location,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         Store::update(cx, |store| store.visited(id, Some(location.clone()), None));
         #[cfg(any(target_os = "macos", windows))]
         if self.browser.pages.contains(id) {

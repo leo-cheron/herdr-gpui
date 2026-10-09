@@ -278,6 +278,39 @@ impl FontConfig {
     }
 }
 
+impl FontConfig {
+    /// The families the config named for this face: its own unless it is a
+    /// platform default, which resolution substitutes when missing, and every
+    /// fallback. Dot-prefixed names are aliases GPUI resolves itself.
+    fn requested(&self) -> impl Iterator<Item = &str> {
+        let family = (self.family != PLATFORM_FONTS.monospace
+            && self.family != PLATFORM_FONTS.sans)
+            .then_some(self.family.as_str());
+        family
+            .into_iter()
+            .chain(self.fallbacks.iter().flatten().map(String::as_str))
+            .filter(|family| !family.starts_with('.'))
+    }
+}
+
+/// The requested families no installed family matches. Platforms match
+/// family names without regard to case, so this does too, rather than
+/// reporting a font that draws.
+fn missing_families<'a>(
+    requested: impl IntoIterator<Item = &'a str>,
+    installed: &BTreeSet<String>,
+) -> Vec<String> {
+    let installed: BTreeSet<String> = installed
+        .iter()
+        .map(|family| family.to_lowercase())
+        .collect();
+    requested
+        .into_iter()
+        .filter(|family| !installed.contains(&family.to_lowercase()))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Ranks an installed Nerd Font family for the automatic cascade. Symbols-only
 /// faces carry the icon ranges without replacing any text glyph, and `Mono`
 /// variants keep every icon inside a single terminal cell, so both come first.
@@ -312,24 +345,35 @@ impl Config {
     /// Gives every face the config left alone an automatic icon-font cascade
     /// and replaces a default family this machine lacks. `installed`
     /// is consulted only when some face still needs it, because enumerating
-    /// system fonts is slow enough to keep off the UI thread.
+    /// system fonts is slow enough to keep off the UI thread. Every family
+    /// the config names is checked against it, so a typo or an uninstalled
+    /// font is reported instead of silently drawn with a substitute.
     pub fn resolve_fonts<I>(&mut self, installed: impl FnOnce() -> I)
     where
         I: IntoIterator<Item = String>,
     {
+        self.replace_undrawable_fonts(super::bitmap_fonts::is_undrawable);
+        let terminal_detects = self.terminal.fallbacks.is_none();
+        let configured = [&self.sidebar, &self.tabs, &self.terminal, &self.ui];
+        let requested: BTreeSet<&str> = configured
+            .into_iter()
+            .flat_map(FontConfig::requested)
+            .collect();
+        let check_defaults = configured
+            .iter()
+            .any(|face| PLATFORM_FONTS.is_replaceable(&face.family));
+        let detect = configured.iter().any(|face| face.fallbacks.is_none());
+        if requested.is_empty() && !check_defaults && !detect {
+            return;
+        }
+        let installed: BTreeSet<String> = installed().into_iter().collect();
+        self.missing_fonts = missing_families(requested, &installed);
         let mut faces = [
             &mut self.sidebar,
             &mut self.tabs,
             &mut self.terminal,
             &mut self.ui,
         ];
-        let check_defaults = faces
-            .iter()
-            .any(|face| PLATFORM_FONTS.is_replaceable(&face.family));
-        if !check_defaults && faces.iter().all(|face| face.fallbacks.is_some()) {
-            return;
-        }
-        let installed: BTreeSet<String> = installed().into_iter().collect();
         if check_defaults {
             for face in faces.iter_mut() {
                 if let Some(family) = PLATFORM_FONTS.substitute(&face.family, &installed) {
@@ -341,9 +385,34 @@ impl Config {
             return;
         }
         let detected = symbol_fallbacks(installed);
+        // Only the terminal draws prompts; an explicit `fallback`, even `[]`,
+        // is a choice the user already made.
+        self.icon_font_missing = detected.is_empty() && terminal_detects;
         for face in faces {
             if face.fallbacks.is_none() {
                 face.fallbacks = Some(detected.clone());
+            }
+        }
+    }
+
+    /// Puts each face whose family `undrawable` rejects back on its default,
+    /// which [`Self::resolve_fonts`] then substitutes if it is not installed.
+    /// The file keeps the chosen family, so a fixed renderer picks it up again.
+    pub(super) fn replace_undrawable_fonts(&mut self, undrawable: impl Fn(&str) -> bool) {
+        let defaults = Config::default();
+        for (face, default) in [
+            (&mut self.sidebar, defaults.sidebar),
+            (&mut self.tabs, defaults.tabs),
+            (&mut self.terminal, defaults.terminal),
+            (&mut self.ui, defaults.ui),
+        ] {
+            if face.family != default.family && undrawable(&face.family) {
+                tracing::warn!(
+                    family = %face.family,
+                    replacement = %default.family,
+                    "Font embeds bitmap glyphs the renderer cannot draw; using the default family"
+                );
+                face.family = default.family;
             }
         }
     }

@@ -130,10 +130,10 @@ fn closing_in_a_group_never_closes_a_tab(cx: &mut TestAppContext) {
     assert_eq!(
         actions(&view, cx, right),
         [
+            Action::NewBrowserTab,
             Action::Close,
             Action::CloseOthers,
             Action::CloseAll,
-            Action::NewBrowserTab,
             Action::Split
         ]
     );
@@ -224,3 +224,5 @@ fn the_menu_opens_from_the_strip_and_steps_with_the_keyboard(cx: &mut TestAppCon
     cx.simulate_keystrokes("escape");
     assert!(view.read_with(cx, |view, _| view.menu.page.is_none()));
 }
+
+mod new_tabs;

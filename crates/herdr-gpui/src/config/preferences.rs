@@ -15,6 +15,9 @@ pub(crate) enum Preference {
     ClipboardEnabled(Option<bool>),
     ClipboardPosition(Option<ClipboardToastPosition>),
     SidebarGap(f32),
+    StatusBar(status_bar::Edit),
+    /// `[usage] inline`: whether the sidebar draws the daemon's configured rows.
+    UsageInline(bool),
 }
 
 impl Config {
@@ -23,7 +26,7 @@ impl Config {
         Self::save_preference_path(edit, &local)
     }
 
-    fn save_preference_path(edit: Preference, path: &Path) -> Result<()> {
+    pub(super) fn save_preference_path(edit: Preference, path: &Path) -> Result<()> {
         let result = (|| -> Result<()> {
             let text = match fs::read_to_string(path) {
                 Ok(text) => text,
@@ -87,6 +90,11 @@ impl Config {
                         })
                     }),
                 ),
+                Preference::StatusBar(edit) => {
+                    let (key, value) = edit.entry();
+                    (Some("status_bar"), key, Some(value))
+                }
+                Preference::UsageInline(value) => (Some("usage"), "inline", Some(value.into())),
                 Preference::SidebarGap(value) => {
                     if !value.is_finite() || !(0.0..=MAX_SIDEBAR_GAP).contains(&value) {
                         return Err(Error::InvalidSidebarGap);
@@ -240,6 +248,27 @@ mod tests {
             );
             assert_eq!(fs::read_to_string(&path)?, original);
         }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preference_save_writes_through_a_symlinked_file() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let dotfiles = directory.path().join("dotfiles");
+        fs::create_dir(&dotfiles)?;
+        let tracked = dotfiles.join("local.toml");
+        fs::write(&tracked, "# tracked\n")?;
+        let link = directory.path().join("local.toml");
+        std::os::unix::fs::symlink(&tracked, &link)?;
+
+        Config::save_preference_path(Preference::ShowSystemLoad(false), &link)?;
+
+        assert!(fs::symlink_metadata(&link)?.file_type().is_symlink());
+        let text = fs::read_to_string(&tracked)?;
+        assert!(text.contains("# tracked"));
+        let table: toml::Table = toml::from_str(&text)?;
+        assert_eq!(table["show_system_load"].as_bool(), Some(false));
         Ok(())
     }
 }

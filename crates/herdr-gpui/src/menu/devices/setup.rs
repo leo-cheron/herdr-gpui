@@ -5,6 +5,7 @@
 use crate::{Error, Result};
 use herdr_client::{Destination, HostProbe, SavedHost};
 use std::{
+    collections::BTreeMap,
     io::Read,
     process::{Command, ExitStatus, Stdio},
     sync::Mutex,
@@ -42,8 +43,14 @@ impl Claim {
         if claims.iter().any(|(claimed, claimed_session, _)| {
             *claimed == destination && claimed_session == session
         }) {
+            tracing::warn!(
+                category = "device_claim",
+                claims = claims.len(),
+                "Host is already claimed by this process"
+            );
             return Err(Error::DeviceAdding);
         }
+        tracing::debug!(category = "device_claim", "Host claimed");
         claims.push((destination.clone(), session.to_owned(), now));
         Ok(Self {
             destination,
@@ -74,6 +81,7 @@ impl Claim {
     /// Keep the host claimed until `CLAIM_TTL`, because the terminal that runs
     /// `machine add` outlives this dialog and cannot report when it finishes.
     pub(super) fn hold(mut self) {
+        tracing::info!(category = "device_claim", "Host held for a terminal setup");
         self.held = true;
     }
 }
@@ -88,6 +96,7 @@ impl Drop for Claim {
             *claimed == self.destination && *session == self.session
         }) {
             claims.remove(index);
+            tracing::debug!(category = "device_claim", "Host released");
         }
     }
 }
@@ -119,6 +128,7 @@ pub(super) fn remove(id: &str) -> Result<()> {
 
 fn remove_with(executable: &std::ffi::OsStr, id: &str) -> Result<()> {
     if !herdr_client::valid_profile_id(id) {
+        tracing::warn!(category = "device_remove", "Invalid profile ID");
         return Err(Error::DeviceSetupInput("This device has no saved profile."));
     }
     let (status, _, stderr) = run_cli(executable, &["machine", "remove", id], REMOVE_TIMEOUT)?;
@@ -164,7 +174,16 @@ pub(super) fn verify_unsaved(request: &Request, claim: &Claim) -> Result<()> {
 /// Device setup is refused for development catalogs, so this is the catalog
 /// `machine add` writes: the terminal command restores the same state root.
 fn load_catalog() -> Result<Vec<SavedHost>> {
-    Ok(herdr_client::load_saved_hosts(false)?)
+    let hosts = herdr_client::load_saved_hosts(false)?;
+    for host in &hosts {
+        tracing::debug!(
+            category = "device_catalog",
+            id = host.id,
+            enabled = host.enabled,
+            "Saved host on disk"
+        );
+    }
+    Ok(hosts)
 }
 
 fn resolve(target: &str) -> Option<Destination> {
@@ -193,7 +212,14 @@ fn ensure_unsaved(
     resolve: impl Fn(&str) -> Option<Destination>,
 ) -> Result<()> {
     match first_saved(request, claim, hosts, resolve) {
-        Some(host) => Err(Error::DeviceExists(host.label.clone())),
+        Some(host) => {
+            tracing::info!(
+                category = "device_catalog",
+                saved_id = host.id,
+                "Host is already saved"
+            );
+            Err(Error::DeviceExists(host.label.clone()))
+        }
         None => Ok(()),
     }
 }
@@ -312,24 +338,57 @@ fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn shell_command(executable: &str, request: &Request, environment: &[(String, String)]) -> String {
-    let mut args = vec!["env".to_owned()];
+/// Prefix of the workspace variables that carry the GUI's environment to the
+/// setup command.
+const STAGED_PREFIX: &str = "HERDR_GPUI_SETUP_";
+
+/// What a local workspace needs to run setup interactively.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TerminalSetup {
+    /// The line typed into the workspace shell. A shell still in canonical
+    /// mode truncates typed input (1024 bytes on macOS), so it never inlines
+    /// unbounded values such as `PATH`.
+    pub(super) command: String,
+    /// Launch environment for the workspace, which the command expands.
+    pub(super) environment: BTreeMap<String, String>,
+}
+
+fn shell_command(
+    executable: &str,
+    request: &Request,
+    environment: &[(String, String)],
+) -> TerminalSetup {
+    let mut words = vec![quote("env")];
     // The daemon's shell does not inherit the GUI's environment. Clear
-    // optional overrides before restoring this window's exact catalog roots.
-    for name in ["HERDR_CONFIG_PATH", "XDG_STATE_HOME", "XDG_CONFIG_HOME"] {
-        args.extend(["-u".into(), name.into()]);
+    // optional overrides and the staging variables before restoring this
+    // window's exact catalog roots.
+    let names = ["HERDR_CONFIG_PATH", "XDG_STATE_HOME", "XDG_CONFIG_HOME"]
+        .map(String::from)
+        .into_iter()
+        .chain(
+            environment
+                .iter()
+                .map(|(key, _)| format!("{STAGED_PREFIX}{key}")),
+        );
+    for name in names {
+        words.extend([quote("-u"), quote(&name)]);
     }
-    args.extend(
+    // Keys are fixed variable names, so the double quotes only expand the
+    // staged value, which the shell passes on verbatim.
+    words.extend(
         environment
             .iter()
-            .map(|(key, value)| format!("{key}={value}")),
+            .map(|(key, _)| format!("\"{key}=${STAGED_PREFIX}{key}\"")),
     );
-    args.push(executable.into());
-    args.extend(request.arguments().into_iter().map(str::to_owned));
-    args.iter()
-        .map(|arg| quote(arg))
-        .collect::<Vec<_>>()
-        .join(" ")
+    words.push(quote(executable));
+    words.extend(request.arguments().into_iter().map(quote));
+    TerminalSetup {
+        command: words.join(" "),
+        environment: environment
+            .iter()
+            .map(|(key, value)| (format!("{STAGED_PREFIX}{key}"), value.clone()))
+            .collect(),
+    }
 }
 
 /// Runs `machine add` without a terminal, for a host whose probe found a
@@ -369,11 +428,22 @@ fn save_with(
     }
     // Without the ID the CLI printed, there is no profile known to be ours.
     let Some(id) = saved_id(&stdout) else {
+        tracing::warn!(
+            category = "device_setup",
+            "machine add printed no profile ID"
+        );
         return Ok(());
     };
+    tracing::info!(category = "device_setup", id, "machine add saved a profile");
     let hosts = load()?;
     match first_saved(request, claim, &hosts, resolve) {
         Some(first) if first.id != id => {
+            tracing::warn!(
+                category = "device_setup",
+                id,
+                first = first.id,
+                "Another client saved this host first; removing ours"
+            );
             remove_with(executable, &id)?;
             Err(Error::DeviceExists(first.label.clone()))
         }
@@ -390,11 +460,54 @@ fn saved_id(stdout: &[u8]) -> Option<String> {
 }
 
 /// Runs the CLI with closed stdin and a deadline, keeping bounded stdout and
-/// stderr. Both pipes are drained so a chatty CLI never blocks on a full one.
+/// stderr.
 fn run_cli(
     executable: &std::ffi::OsStr,
     args: &[&str],
     timeout: Duration,
+) -> Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
+    run_bounded(executable, args, timeout, SAVE_STDERR_LIMIT)
+}
+
+/// Runs a program with closed stdin and a deadline, keeping at most `limit`
+/// bytes of each of stdout and stderr. Both pipes are drained so a chatty
+/// program never blocks on a full one. A missed deadline kills the program and
+/// returns `DeviceSetupTimeout`. Blocks: call it from the background executor.
+pub(super) fn run_bounded(
+    executable: &std::ffi::OsStr,
+    args: &[&str],
+    timeout: Duration,
+    limit: u64,
+) -> Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
+    let started = Instant::now();
+    let result = run_bounded_untraced(executable, args, timeout, limit);
+    // Only the subcommand: later arguments name hosts and labels, and the
+    // output can carry remote text, so neither is logged.
+    let command = &args[..args.len().min(2)];
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match &result {
+        Ok((status, ..)) => tracing::info!(
+            category = "device_cli",
+            ?command,
+            %status,
+            elapsed_ms,
+            "Device command finished"
+        ),
+        Err(_) => tracing::warn!(
+            category = "device_cli",
+            ?command,
+            elapsed_ms,
+            "Device command failed to run"
+        ),
+    }
+    result
+}
+
+fn run_bounded_untraced(
+    executable: &std::ffi::OsStr,
+    args: &[&str],
+    timeout: Duration,
+    limit: u64,
 ) -> Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
     let mut child = Command::new(executable)
         .args(args)
@@ -408,7 +521,7 @@ fn run_cli(
             .spawn(move || {
                 let mut output = Vec::new();
                 if let Some(mut pipe) = pipe {
-                    let _ = (&mut pipe).take(SAVE_STDERR_LIMIT).read_to_end(&mut output);
+                    let _ = (&mut pipe).take(limit).read_to_end(&mut output);
                     let _ = std::io::copy(&mut pipe, &mut std::io::sink());
                 }
                 output
@@ -444,7 +557,7 @@ fn run_cli(
 }
 
 /// The CLI ends with its most specific error; earlier lines are progress.
-fn last_line(output: &[u8]) -> String {
+pub(super) fn last_line(output: &[u8]) -> String {
     String::from_utf8_lossy(output)
         .lines()
         .map(str::trim)
@@ -457,7 +570,7 @@ fn last_line(output: &[u8]) -> String {
 }
 
 /// The shell command a local workspace runs to set the host up interactively.
-pub(super) fn terminal_command(request: &Request) -> Result<String> {
+pub(super) fn terminal_command(request: &Request) -> Result<TerminalSetup> {
     if cfg!(windows) {
         return Err(Error::DeviceSetupInput(
             "Saved SSH devices are unavailable on Windows.",
