@@ -284,6 +284,20 @@ fn a_late_answer_keeps_every_notch_and_the_rest() {
 }
 
 #[test]
+fn turning_back_before_an_answer_keeps_the_rest_between_rows() {
+    let mut scroll = SmoothScroll::default();
+    let start = Instant::now();
+    assert_eq!(scroll.wheel(&back(10), "pane", 0.25, start), Some(1));
+    // Turning back before row 11 lands asks for row 9.
+    assert_eq!(scroll.wheel(&back(10), "pane", -0.1, start), Some(-2));
+    // Row 11 then lands: an answer, not the keyboard.
+    scroll.observe(&back(10), &back(11));
+    scroll.observe(&back(11), &back(9));
+    let (offset, _) = offset(&mut scroll, start + 10 * SPREAD).unwrap();
+    assert!((offset - 0.9).abs() < 1e-4, "{offset}");
+}
+
+#[test]
 fn a_few_blank_rows_never_pass_for_a_scroll() {
     let blank = |rows: [&str; 6]| {
         let mut frame = (*back(10)).clone();

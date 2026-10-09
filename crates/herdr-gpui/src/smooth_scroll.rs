@@ -45,6 +45,9 @@ struct Motion {
     target: f64,
     /// The row the motion is entering, already asked of the daemon.
     requested: i64,
+    /// Every request not yet fully shown, oldest first, as the rows it moves
+    /// between: the daemon answers in order, anywhere along the way.
+    pending: VecDeque<(i64, i64)>,
     recent: VecDeque<(Instant, f64)>,
     last: Instant,
     /// Earlier surfaces with their offsets, newest first.
@@ -140,6 +143,7 @@ impl SmoothScroll {
             shown: offset,
             target: offset as f64,
             requested: offset as i64,
+            pending: VecDeque::new(),
             recent: VecDeque::new(),
             last: now,
             behind: Vec::new(),
@@ -168,7 +172,13 @@ impl SmoothScroll {
         if lines * rows.signum() as i64 <= 0 {
             return Some(0);
         }
+        motion
+            .pending
+            .push_back((motion.requested, motion.requested + lines));
         motion.requested += lines;
+        if motion.pending.len() > MAX_RECENT {
+            motion.pending.pop_front();
+        }
         Some(lines as i16)
     }
 
@@ -195,11 +205,16 @@ impl SmoothScroll {
             .filter(|shift| shift.abs() < height)
             .filter_map(|shift| i32::try_from(shift).ok())
             .find(|shift| rows_shifted(&previous.frame, &next.frame, motion.rect, *shift));
-        // A scroll beyond the rows asked for, such as the keyboard's, ends
-        // the motion where the daemon put it, however late the answer lands.
-        let owed = motion.requested - from as i64;
-        let asked = |shift: i64| shift.signum() == owed.signum() && shift.abs() <= owed.abs();
-        if picture.is_some_and(|shift| shift != 0 && !asked(i64::from(shift))) {
+        // A scroll to a row never asked for, such as the keyboard's, ends the
+        // motion where the daemon put it, however late the answer lands.
+        let landed = picture
+            .filter(|shift| *shift != 0)
+            .map(|shift| from as i64 + i64::from(shift));
+        let answer = landed.map(|landed| {
+            let along = |(a, b): &(i64, i64)| a.min(b) <= &landed && &landed <= a.max(b);
+            motion.pending.iter().position(along)
+        });
+        if let Some(None) = answer {
             self.motion = None;
             return;
         }
@@ -207,6 +222,16 @@ impl SmoothScroll {
             let output = moved - i64::from(shift);
             motion.target += output as f64;
             motion.requested += output;
+            if let (Some(landed), Some(Some(answer))) = (landed, answer) {
+                motion.pending.drain(..answer);
+                if let Some(first) = motion.pending.front_mut() {
+                    first.0 = landed;
+                }
+            }
+            for (start, end) in &mut motion.pending {
+                *start += output;
+                *end += output;
+            }
             for (_, at) in &mut motion.behind {
                 *at = at.saturating_add_signed(output);
             }
@@ -220,6 +245,7 @@ impl SmoothScroll {
             motion.recent.clear();
             motion.target = to as f64;
             motion.requested = to as i64;
+            motion.pending.clear();
         }
         motion.shown = to;
     }
