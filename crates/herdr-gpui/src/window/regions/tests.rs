@@ -9,8 +9,6 @@ use herdr_client::protocol::{
 };
 use std::sync::Arc;
 
-#[cfg(feature = "integration-test")]
-mod slide_paint;
 mod slides;
 
 fn rect(x: u16, y: u16, width: u16, height: u16) -> SurfaceRect {

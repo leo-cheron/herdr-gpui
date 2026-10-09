@@ -1,20 +1,7 @@
-//! Wheel scrolling drawn exactly where the OS puts it.
-//!
-//! The OS reports a trackpad or wheel gesture as fractional deltas, already
-//! eased through its momentum. The daemon can only show whole rows, at most
-//! one surface per render interval (16 ms upstream). So the pane is drawn at
-//! the OS's position, each delta slid in over `SPREAD` to cover the daemon's
-//! latency, from the rows of the presented surface and of the earlier ones that
-//! showed the rows it uncovers. The daemon is asked for each row as the motion
-//! enters it, so the rows to draw are normally already on screen; where they
-//! are not, the drawing waits at the nearest one it has. When the gesture
-//! stops part-way into a row, the pane rests there, and hit testing follows the
-//! same offset (`HerdrWindow::grid_position`).
-//!
-//! Earlier surfaces fill only when the pane's rows show the shift. Output
-//! arriving while scrolled back moves the offset without moving the picture;
-//! a picture that cannot be followed, or a scroll the wheel did not ask for,
-//! ends the motion at the daemon's row.
+//! Wheel scrolling drawn where the OS's deltas put it, between the daemon's
+//! whole-row surfaces. Uncovered rows are filled from earlier surfaces, and
+//! rows no surface showed are never drawn. The pane rests where the gesture
+//! stops, and hit testing follows (`HerdrWindow::grid_position`).
 
 use herdr_client::protocol::{FrameData, PaneSurfaceFrame, SurfaceRect};
 use std::{
@@ -23,31 +10,23 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Each delta slides in over this long: the daemon's render interval plus
-/// transport, so the row a delta reaches has normally arrived by then.
+/// Each delta slides in over this long: the daemon's 16 ms render interval
+/// plus transport.
 const SPREAD: Duration = Duration::from_millis(48);
-/// Earlier surfaces kept to fill the rows the drawing uncovers.
 const MAX_BEHIND: usize = 4;
-/// Deltas kept while they slide in; a trackpad sends about one per frame.
 const MAX_RECENT: usize = 64;
 
-/// One pane to paint offset this frame.
 #[derive(Clone)]
 pub(crate) struct Slide {
     pub(crate) pane_id: String,
-    /// The pane's inner rectangle, which clips the content as it slides.
     pub(crate) rect: SurfaceRect,
-    /// Rows the current frame's pane content is drawn below its grid position.
+    /// Rows the content is drawn below its grid position.
     pub(crate) offset: f32,
-    /// Earlier frames, nearest first, each with the rows the content has moved
-    /// down since it, all in one direction. Each fills the rows uncovered
-    /// beyond those the frames before it can.
+    /// Earlier frames, nearest first, with the rows moved since each.
     pub(crate) behind: Vec<(Arc<PaneSurfaceFrame>, i32)>,
 }
 
 impl Slide {
-    /// Whether `other` draws exactly the same, so a resting pane keeps its
-    /// cached paint.
     pub(crate) fn paints_like(&self, other: &Self) -> bool {
         self.pane_id == other.pane_id
             && self.rect == other.rect
@@ -62,22 +41,17 @@ impl Slide {
 struct Motion {
     pane_id: String,
     rect: SurfaceRect,
-    /// The presented surface's offset.
     shown: u64,
-    /// Where the OS has put the content.
     target: f64,
-    /// The offset the daemon has been asked for: the row the motion is
-    /// entering, so it is normally on screen before the drawing reaches it.
+    /// The row the motion is entering, already asked of the daemon.
     requested: i64,
-    /// Deltas still sliding in, oldest first.
     recent: VecDeque<(Instant, f64)>,
     last: Instant,
-    /// Earlier verified surfaces with the offset each showed, newest first.
+    /// Earlier surfaces with their offsets, newest first.
     behind: Vec<(Arc<PaneSurfaceFrame>, u64)>,
 }
 
 impl Motion {
-    /// This motion's pane's scrollback offset in `surface`.
     fn scrolled(&self, surface: &PaneSurfaceFrame) -> Option<u64> {
         surface
             .panes
@@ -87,7 +61,6 @@ impl Motion {
             .map(|scroll| scroll.offset_from_bottom)
     }
 
-    /// Rows from the bottom drawn at `now`.
     fn drawn(&self, now: Instant) -> f64 {
         let pending: f64 = self
             .recent
@@ -109,7 +82,6 @@ impl Motion {
         shown + wanted.clamp(-reach, reach)
     }
 
-    /// Rows the pane's content is drawn below its grid position at `now`.
     fn offset(&self, now: Instant) -> f32 {
         (self.drawn(now) - self.shown as f64) as f32
     }
@@ -121,10 +93,8 @@ pub(crate) struct SmoothScroll {
 }
 
 impl SmoothScroll {
-    /// Records that the OS scrolled `pane_id` by `rows` (up into history is
-    /// positive) over `presented`, and returns the lines to scroll the daemon,
-    /// or `None` when the pane's scrollback does not follow the wheel: an
-    /// application reading it moves no scrollback to draw.
+    /// Returns the lines to send for `rows` (up is positive), or `None` when
+    /// an application reads the wheel instead of the scrollback.
     pub(crate) fn wheel(
         &mut self,
         presented: &PaneSurfaceFrame,
@@ -152,8 +122,7 @@ impl SmoothScroll {
             .filter(|motion| motion.pane_id == pane_id && motion.rect == pane.inner_rect)
             .map(|mut motion| {
                 let drawn = motion.drawn(now);
-                // A gesture resuming while its deltas still slide in, or
-                // turning back, starts from where the content is drawn.
+                // Turning back or resuming starts from what is drawn.
                 let reversed = motion
                     .recent
                     .back()
@@ -175,7 +144,6 @@ impl SmoothScroll {
             last: now,
             behind: Vec::new(),
         }));
-        // The scrollback ends both ways; motion past an end draws nothing.
         let max = scroll.max_offset_from_bottom as f64;
         let rows = (motion.target + rows).clamp(0., max) - motion.target;
         if rows == 0. {
@@ -196,7 +164,6 @@ impl SmoothScroll {
             true => motion.target.ceil(),
             false => motion.target.floor(),
         } as i64;
-        // Bound each event's work, as the wheel's own accumulator does.
         let lines = (entering - motion.requested).clamp(-128, 128);
         if lines * rows.signum() as i64 <= 0 {
             return Some(0);
@@ -205,7 +172,6 @@ impl SmoothScroll {
         Some(lines as i16)
     }
 
-    /// Records that `next` replaced `previous` on screen at `now`.
     pub(crate) fn observe(
         &mut self,
         previous: &Arc<PaneSurfaceFrame>,
@@ -223,9 +189,8 @@ impl SmoothScroll {
             self.motion = None;
             return;
         };
-        // The picture's own shift: the scroll, nothing when output arrived
-        // while scrolled back, or the scroll less output arriving with it.
-        // The shifts nearest the scroll are tried first, so usually one is.
+        // The picture's shift may differ from the offset's when output
+        // arrives while scrolled back; the nearest shifts are tried first.
         let moved = to as i64 - from as i64;
         let height = i64::from(motion.rect.height);
         let nearest = moved.max(1 - height).min(height - 1);
@@ -235,15 +200,12 @@ impl SmoothScroll {
             .filter(|shift| shift.abs() < height)
             .filter_map(|shift| i32::try_from(shift).ok())
             .find(|shift| rows_shifted(&previous.frame, &next.frame, motion.rect, *shift));
-        // Long after the gesture, a scroll the wheel did not ask for, such as
-        // the keyboard's, ends the motion where the daemon put it.
+        // A scroll the wheel did not ask for, such as the keyboard's.
         if picture.is_some_and(|shift| shift != 0) && now >= motion.last + 2 * SPREAD {
             self.motion = None;
             return;
         }
         if let Some(shift) = picture {
-            // Rows that arrived without moving the picture move the OS's
-            // position and the earlier surfaces with the offset.
             let output = moved - i64::from(shift);
             motion.target += output as f64;
             motion.requested += output;
@@ -256,7 +218,6 @@ impl SmoothScroll {
                 motion.behind.truncate(MAX_BEHIND);
             }
         } else {
-            // A picture that cannot be followed restarts the motion at it.
             motion.behind.clear();
             motion.recent.clear();
             motion.target = to as f64;
@@ -265,22 +226,18 @@ impl SmoothScroll {
         motion.shown = to;
     }
 
-    /// Whether the drawing still moves after `now`, so the next frame differs.
     pub(crate) fn moving(&self, now: Instant) -> bool {
         self.motion
             .as_ref()
             .is_some_and(|motion| now < motion.last + SPREAD)
     }
 
-    /// The moving or resting pane's inner rectangle and its content's offset
-    /// in rows at `now`, for hit testing what is drawn there.
+    /// The pane's rect and offset, for hit testing.
     pub(crate) fn offset(&self, now: Instant) -> Option<(SurfaceRect, f32)> {
         let motion = self.motion.as_ref()?;
         Some((motion.rect, motion.offset(now)))
     }
 
-    /// The pane drawn offset at `now`; a motion resting on the daemon's row
-    /// ends.
     pub(crate) fn slide(&mut self, now: Instant) -> Option<Slide> {
         let motion = self.motion.as_ref()?;
         let offset = motion.offset(now);
@@ -316,9 +273,7 @@ impl SmoothScroll {
     }
 }
 
-/// Whether most rows of `rect` in `new` that were already on screen in `old`
-/// show the same cells `shift` rows further down. A few may differ: rows of
-/// the live screen below the scrollback, such as a status line, keep changing.
+/// Whether most rows of `rect` match `shift` rows down; a status line may not.
 fn rows_shifted(old: &FrameData, new: &FrameData, rect: SurfaceRect, shift: i32) -> bool {
     if old.width != new.width || old.height != new.height {
         return false;
