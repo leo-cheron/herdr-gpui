@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     smooth_scroll::Slide,
     terminal_painter::TerminalPainter,
-    window::regions::{Region, RegionView},
+    window::regions::{Region, RegionView, Sliding},
 };
 use gpui::{AppContext, Empty, IntoElement, ParentElement, Point, Styled, px, size};
 use std::{cell::RefCell, rc::Rc};
@@ -41,21 +41,23 @@ fn a_sliding_region_fills_only_its_uncovered_edge_from_earlier_frames(cx: &mut T
     let (_, cx) = cx.add_window_view(|_, _| Empty);
     // Bands of 2 then 1 rows from two earlier frames; then one reversed.
     for (behind, band) in [(vec![2, 3], 3), (vec![-1], 1)] {
+        let area = partition(&current.frame, &current.panes).remove(0).1;
+        let slide = Slide {
+            pane_id: "p".into(),
+            rect: current.panes[0].inner_rect,
+            offset: -behind[behind.len() - 1] as f32 / 2.,
+            behind: behind
+                .iter()
+                .map(|shift| (previous.clone(), *shift))
+                .collect(),
+        };
         let region = Rc::new(Region {
             owner: Owner::Pane("p".into()),
             surface: current.clone(),
-            area: partition(&current.frame, &current.panes).remove(0).1,
+            slide: Some(Sliding::new(slide, &area)),
+            area,
             highlights: vec![],
             look: look(),
-            slide: Some(Slide {
-                pane_id: "p".into(),
-                rect: current.panes[0].inner_rect,
-                offset: -behind[behind.len() - 1] as f32 / 2.,
-                behind: behind
-                    .iter()
-                    .map(|shift| (previous.clone(), *shift))
-                    .collect(),
-            }),
         });
         let painter = Rc::new(RefCell::new(TerminalPainter::default()));
         let before = cx.update(|_, cx| *cx.default_global::<crate::performance::Counts>());

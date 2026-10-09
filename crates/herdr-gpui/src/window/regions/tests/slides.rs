@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     smooth_scroll::Slide,
     terminal_painter::Span,
-    window::regions::{Region, split},
+    window::regions::{Region, Sliding, split},
 };
 
 fn span(row: u16, columns: std::ops::Range<u16>) -> Span {
@@ -27,7 +27,22 @@ fn split_keeps_every_cell_on_exactly_one_side_of_the_rect() {
 }
 
 #[test]
-fn a_sliding_region_never_replays_its_last_paint() {
+fn a_band_paints_only_the_cells_inside_the_pane_on_its_rows() {
+    let area: Vec<_> = (0..5).map(|row| span(row, 0..6)).collect();
+    let slide = Slide {
+        pane_id: "p".into(),
+        rect: rect(1, 1, 4, 3),
+        offset: 0.,
+        behind: vec![],
+    };
+    let sliding = Sliding::new(slide, &area);
+    assert_eq!(sliding.rows(0..1), []);
+    assert_eq!(sliding.rows(2..4), [span(2, 1..5), span(3, 1..5)]);
+    assert_eq!(sliding.rows(3..9), [span(3, 1..5)]);
+}
+
+#[test]
+fn a_region_replays_only_a_slide_drawn_at_the_same_offset() {
     let surface = Arc::new(PaneSurfaceFrame {
         boot_id: String::new(),
         projection_revision: 0,
@@ -46,17 +61,24 @@ fn a_sliding_region_never_replays_its_last_paint() {
         look: look(),
         slide: None,
     };
+    let slide = |offset| Slide {
+        pane_id: "p".into(),
+        rect: rect(0, 0, 4, 1),
+        offset,
+        behind: vec![],
+    };
     let sliding = Region {
-        slide: Some(Slide {
-            pane_id: "p".into(),
-            rect: rect(0, 0, 4, 1),
-            offset: 0.,
-            behind: vec![],
-        }),
+        slide: Some(Sliding::new(slide(-0.5), &at_rest.area)),
+        ..at_rest.clone()
+    };
+    let moved = Region {
+        slide: Some(Sliding::new(slide(-0.25), &at_rest.area)),
         ..at_rest.clone()
     };
     assert!(at_rest.paints_like(&at_rest));
-    assert!(!sliding.paints_like(&sliding));
+    // A pane resting mid-row keeps its paint; a moving one repaints.
+    assert!(sliding.paints_like(&sliding));
+    assert!(!sliding.paints_like(&moved));
     // Coming to rest repaints once without the offset.
     assert!(!sliding.paints_like(&at_rest));
 }

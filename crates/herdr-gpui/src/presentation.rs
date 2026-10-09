@@ -11,13 +11,11 @@
 //!
 //! Retained cells are presentation only. Hit testing, input routing, and IME
 //! placement keep reading `LiveState::surface`, so a retained frame can never
-//! aim a click or a keystroke at a pane the client has already left. The same
-//! holds for the scroll slides it paints between surfaces (`smooth_scroll`).
+//! aim a click or a keystroke at a pane the client has already left. A pane
+//! drawn mid-row after a wheel scroll (`smooth_scroll`) is the one exception:
+//! hit testing and IME placement follow its offset, since that is what shows.
 
-use crate::{
-    smooth_scroll::{Slide, SmoothScroll},
-    state::LiveState,
-};
+use crate::{smooth_scroll::SmoothScroll, state::LiveState};
 use herdr_client::{SurfaceImages, protocol::PaneSurfaceFrame};
 use std::{sync::Arc, time::Instant};
 
@@ -34,7 +32,9 @@ pub(crate) struct Presentation {
     /// The pixels the presented frame was shown with. A retained frame keeps
     /// them, since the connection's own set follows the newest surface.
     images: Arc<SurfaceImages>,
-    scroll: SmoothScroll,
+    /// Wheel scrolling drawn between the daemon's rows, fed the presented
+    /// frame's transitions.
+    pub(crate) scroll: SmoothScroll,
     #[cfg(feature = "integration-test")]
     pub(crate) probe: Probe,
 }
@@ -80,14 +80,11 @@ impl Presentation {
                 .is_some_and(|snapshot| snapshot.boot_id == presented.boot_id)
     }
 
-    /// The panes to paint mid-slide at `now`, against the presented frame.
-    /// Without `animate`, as while the scrollbar is dragged, slides stop: the
-    /// content must sit exactly where the pointer put it.
-    pub(crate) fn slides(&mut self, now: Instant, animate: bool) -> Vec<Slide> {
-        if !animate {
-            self.scroll.clear();
-        }
-        self.scroll.slides(now)
+    /// Records that the OS scrolled `pane_id` by `rows`, up into history being
+    /// positive, and returns the lines to send (see `SmoothScroll::wheel`).
+    pub(crate) fn wheel(&mut self, pane_id: &str, rows: f32) -> Option<i16> {
+        let presented = self.presented.as_ref()?;
+        self.scroll.wheel(presented, pane_id, rows, Instant::now())
     }
 
     /// Forget the picture. Another connection's window is not this one's, so a

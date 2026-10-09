@@ -107,10 +107,11 @@ impl HerdrWindow {
         {
             return None;
         }
+        let (x, y) = self.grid_position(position);
         LinkCell::at(
             self.live.surface.as_deref()?,
-            f32::from(position.x - self.bounds.origin.x),
-            f32::from(position.y - self.bounds.origin.y),
+            x,
+            y,
             self.cell_width,
             self.config.terminal.line_height(),
         )

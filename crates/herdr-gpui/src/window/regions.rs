@@ -38,15 +38,47 @@ struct Region {
     area: Vec<Span>,
     highlights: Vec<Highlight>,
     look: Look,
-    slide: Option<Slide>,
+    slide: Option<Sliding>,
+}
+
+/// A region's slide with its cells split once, at the pane's inner edge, for
+/// every layer to paint.
+#[derive(Clone)]
+struct Sliding {
+    slide: Slide,
+    /// The cells inside the pane's inner rectangle, row by row.
+    inside: Vec<Span>,
+    outside: Vec<Span>,
+}
+
+impl Sliding {
+    fn new(slide: Slide, area: &[Span]) -> Self {
+        let (inside, outside) = split(area, slide.rect);
+        Self {
+            slide,
+            inside,
+            outside,
+        }
+    }
+
+    /// The cells inside the pane on `rows`.
+    fn rows(&self, rows: Range<u16>) -> &[Span] {
+        let start = self.inside.partition_point(|span| span.row < rows.start);
+        let end = self.inside.partition_point(|span| span.row < rows.end);
+        &self.inside[start..end]
+    }
 }
 
 impl Region {
     /// Whether `next` paints exactly what this region already painted. A
-    /// slide moves with time, so a sliding region never does.
+    /// moving slide never does; a resting one does while it stays put.
     fn paints_like(&self, next: &Self) -> bool {
-        self.slide.is_none()
-            && next.slide.is_none()
+        let slide = match (&self.slide, &next.slide) {
+            (None, None) => true,
+            (Some(old), Some(new)) => old.slide.paints_like(&new.slide),
+            _ => false,
+        };
+        slide
             && self.area == next.area
             && self.highlights == next.highlights
             && self.look == next.look
@@ -202,7 +234,7 @@ impl Render for RegionView {
                     );
                 };
                 let surface = &region.surface;
-                let Some(slide) = &region.slide else {
+                let Some(sliding) = &region.slide else {
                     paint(
                         &surface.frame,
                         bounds.origin,
@@ -217,11 +249,11 @@ impl Render for RegionView {
                 // The pane's border stays put while its content slides inside
                 // it. Backgrounds paint at rest under the slide, so the
                 // sub-cell remainder past the grid's last row stays filled.
+                let slide = &sliding.slide;
                 let rect = slide.rect;
-                let (inside, outside) = split(&region.area, rect);
                 let still = match layer {
                     Layer::Backgrounds => &region.area,
-                    Layer::Text | Layer::Decorations => &outside,
+                    Layer::Text | Layer::Decorations => &sliding.outside,
                 };
                 paint(
                     &surface.frame,
@@ -255,14 +287,10 @@ impl Render for RegionView {
                             .unwrap_or(rect.height)
                             .min(rect.height);
                         filled = *shift;
-                        let band = SurfaceRect {
-                            y: if *shift > 0 {
-                                rect.y + rect.height - rows
-                            } else {
-                                rect.y
-                            },
-                            height: rows,
-                            ..rect
+                        let bottom = rect.y.saturating_add(rect.height);
+                        let band = match *shift > 0 {
+                            true => bottom - rows..bottom,
+                            false => rect.y..rect.y + rows,
                         };
                         let y = offset + *shift as f32 * cell_height;
                         paint(
@@ -271,7 +299,7 @@ impl Render for RegionView {
                             None,
                             &[],
                             &[],
-                            &split(&region.area, band).0,
+                            sliding.rows(band),
                             window,
                         );
                     }
@@ -281,7 +309,7 @@ impl Render for RegionView {
                         None,
                         &region.highlights,
                         &surface.panes,
-                        &inside,
+                        &sliding.inside,
                         window,
                     );
                 });
@@ -333,7 +361,7 @@ impl HerdrWindow {
         &mut self,
         surface: Option<&Arc<PaneSurfaceFrame>>,
         highlights: &[Highlight],
-        mut slides: Vec<Slide>,
+        mut slide: Option<Slide>,
         look: &Look,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
@@ -344,12 +372,10 @@ impl HerdrWindow {
         let mut previous = std::mem::take(&mut self.regions);
         for (owner, area) in partition(&surface.frame, &surface.panes) {
             let slide = match &owner {
-                Owner::Pane(id) => slides
-                    .iter()
-                    .position(|slide| slide.pane_id == *id)
-                    .map(|index| slides.swap_remove(index)),
+                Owner::Pane(id) => slide.take_if(|slide| slide.pane_id == *id),
                 Owner::Chrome => None,
-            };
+            }
+            .map(|slide| Sliding::new(slide, &area));
             let region = Rc::new(Region {
                 owner,
                 surface: surface.clone(),

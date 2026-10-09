@@ -175,36 +175,18 @@ at p50/p95 5.62/7.85 ms. It is the daemon's cadence. Herdr renders at most once 
 arrive as 116 surfaces for 240 inputs, gaps p50/p95 17.44/18.50 ms, mostly 2-row
 (1: 6, 2: 94, 3: 15) jumps out of phase with the display.
 
-`smooth_scroll` slides each verified whole-row shift back to rest over 1.5 step
-intervals, filling the uncovered edge from up to four earlier surfaces. A step
-interval is the daemon's smoothed cadence, or the gap since the previous step
-when that is longer (up to 200 ms), so a dying trackpad momentum keeps moving
-between its sparse steps. Replaying the recorded arrival timeline above, sampled
-at vsync, with cadence-only pacing (before the gap rule was added):
+`smooth_scroll` draws a pane where the OS's wheel deltas put it, rather than
+timing the daemon's jumps. Each delta slides in over 48 ms, which covers that
+cadence plus transport, and the wheel asks the daemon for each row as the motion
+enters it, so the rows to draw are normally on screen already. They are filled
+from the presented surface and up to four earlier ones. The OS's own momentum
+easing therefore reaches the screen unchanged, and the drawing trails it by about
+24 ms. When the gesture stops part-way into a row, the pane rests there, and hit
+testing follows the drawn offset. Rows that no surface has shown yet are never
+drawn; the drawing waits for them. Scrollbar drags, keyboard scrolling, and
+scrolling by other clients land on the daemon's row.
 
-| Display | Rows/frame SD, raw → slid | Max rows/frame | Frames without motion |
-| --- | --- | --- | --- |
-| 120 Hz | 1.079 → 0.184 | 3.00 → 1.34 | 121/231 → 0/231 |
-| 60 Hz | 0.593 → 0.394 | 3.00 → 2.69 | 5/108 → 0/108 |
-
-During fast scrolling a slide trails the daemon by at most about 1.5 render
-intervals (about 26 ms); a slow momentum tail trails by up to 1.5 of its own
-step gaps. The live surface, used for input and selection, is never delayed.
-Scrollbar drags are direct manipulation and never slide.
-
-Cost: only the sliding pane's region repaints; other panes replay their cached
-scene, and nothing changes at rest. The price is frame count, since a slide draws
-every display frame rather than once per surface. Release builds on an Apple M1
-Max, macOS 26.6, Herdr 0.9.3, driving `pane.scroll` one line at a time at 120/s
-through the API socket, with CPU from `ps` and GPU from the process's
-`accumulatedGPUTime`. Each figure is the range of interleaved runs with the
-window on a 100/120 Hz display:
-
-| Build | Scrolling CPU | Scrolling GPU | Idle CPU |
-| --- | --- | --- | --- |
-| Without slides | 10-13% | 4.5-5.5% | ~2% |
-| With slides | 18-22% | 7-11.5% | ~2% |
-
-On a 60 Hz display, where frames and surfaces arrive at about the same rate, both
-measured 6-8% CPU and 2-3% GPU. Most of the extra main-thread time is Metal
-drawing and presenting the additional frames, not terminal painting.
+Cost: only the moving pane's region repaints, every display frame while the
+gesture lasts and for 48 ms after it. Other panes replay their cached scene, and
+a resting pane keeps its cached paint. The extra main-thread time is mostly Metal
+drawing and presenting those frames, not terminal painting.

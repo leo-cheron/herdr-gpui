@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used)]
 use super::*;
-use herdr_client::protocol::{CellData, PaneSurfaceScrollMetrics};
+use herdr_client::protocol::{CellData, PaneSurfacePane, PaneSurfaceScrollMetrics};
 
 const ROWS: u16 = 6;
 const MS: Duration = Duration::from_millis(1);
@@ -64,147 +64,200 @@ fn surface(top: u32, offset: u64) -> Arc<PaneSurfaceFrame> {
     })
 }
 
+/// The pane scrolled back `n` rows from a bottom row reading 1000.
+fn back(n: u32) -> Arc<PaneSurfaceFrame> {
+    surface(1000 - n, u64::from(n))
+}
+
+/// The slide's offset and the shifts of the frames behind it.
 fn offset(scroll: &mut SmoothScroll, now: Instant) -> Option<(f32, Vec<i32>)> {
-    let slides = scroll.slides(now);
-    assert!(slides.len() <= 1);
-    slides
-        .first()
+    scroll
+        .slide(now)
         .map(|slide| (slide.offset, slide.behind.iter().map(|(_, s)| *s).collect()))
 }
 
 #[test]
-fn a_verified_shift_slides_from_the_old_position_to_rest_over_the_interval() {
+fn the_pane_is_drawn_where_the_os_put_it_and_rests_there() {
     let mut scroll = SmoothScroll::default();
     let start = Instant::now();
-    // Scrolling back two rows moves the content down: row 0 now reads 98.
-    let (old, new) = (surface(100, 10), surface(98, 12));
-    scroll.observe(&old, &new, start);
-    assert_eq!(offset(&mut scroll, start), Some((-2., vec![2])));
-    assert_eq!(offset(&mut scroll, start + 12 * MS), Some((-1., vec![2])));
-    assert_eq!(offset(&mut scroll, start + 24 * MS), None);
-
-    // Toward the bottom the content moves up and slides down into place.
-    scroll.observe(&new, &old, start + 30 * MS);
-    assert_eq!(offset(&mut scroll, start + 30 * MS), Some((2., vec![-2])));
+    let (a, b) = (back(10), back(11));
+    // Entering row 11 asks the daemon for it at once.
+    assert_eq!(scroll.wheel(&a, "pane", 0.25, start), Some(1));
+    // Asked one row ahead, the daemon shows row 11; row 10 fills behind it.
+    scroll.observe(&a, &b, start);
+    assert_eq!(offset(&mut scroll, start), Some((-1., vec![1])));
+    assert_eq!(
+        offset(&mut scroll, start + 24 * MS),
+        Some((-0.875, vec![1]))
+    );
+    assert_eq!(offset(&mut scroll, start + SPREAD), Some((-0.75, vec![1])));
+    // The gesture stopped a quarter into row 11: it rests there.
+    let later = start + 100 * SPREAD;
+    assert_eq!(offset(&mut scroll, later), Some((-0.75, vec![1])));
+    // Hit testing targets the cells where they are drawn.
+    assert_eq!(scroll.offset(later), Some((b.panes[0].inner_rect, -0.75)));
+    // A resting pane is not redrawn, and resumes from where it is drawn.
+    assert!(!scroll.moving(later));
+    assert_eq!(scroll.wheel(&b, "pane", 0.125, later), Some(0));
+    assert!(scroll.moving(later));
+    assert_eq!(offset(&mut scroll, later + SPREAD), Some((-0.625, vec![1])));
+    // Landing on a whole row ends the motion.
+    assert_eq!(scroll.wheel(&b, "pane", 0.625, later + SPREAD), Some(0));
+    assert_eq!(offset(&mut scroll, later + 2 * SPREAD), None);
 }
 
 #[test]
-fn metrics_or_rows_alone_never_start_a_slide() {
+fn rows_no_surface_showed_are_never_drawn() {
+    let mut scroll = SmoothScroll::default();
+    let start = Instant::now();
+    // The OS is 2.5 rows on, the daemon one: the drawing waits at row 11.
+    assert_eq!(scroll.wheel(&back(10), "pane", 2.5, start), Some(3));
+    scroll.observe(&back(10), &back(11), start);
+    assert_eq!(offset(&mut scroll, start + SPREAD), Some((0., vec![])));
+    // A changing status row still lets the picture be followed, so a step
+    // back, resuming from the row drawn, draws from the frames behind.
+    let mut status = (*back(12)).clone();
+    status.frame.cells[usize::from(ROWS - 1) * 4].symbol = "x".into();
+    scroll.observe(&back(11), &status, start);
+    assert_eq!(scroll.wheel(&status, "pane", -1., start + SPREAD), Some(-2));
+    assert_eq!(
+        offset(&mut scroll, start + 2 * SPREAD),
+        Some((-1., vec![1]))
+    );
+    // Rows that mostly changed cannot be filled from: it restarts there.
+    let mut changed = (*back(13)).clone();
+    for cell in &mut changed.frame.cells[8..] {
+        cell.symbol = "x".into();
+    }
+    scroll.observe(&Arc::new(status), &changed, start + SPREAD);
+    assert_eq!(offset(&mut scroll, start + 2 * SPREAD), None);
+    // Back the other way, nothing has shown the rows below.
+    assert_eq!(
+        scroll.wheel(&changed, "pane", -3., start + 2 * SPREAD),
+        Some(-3)
+    );
+    assert_eq!(offset(&mut scroll, start + 3 * SPREAD), Some((0., vec![])));
+}
+
+#[test]
+fn motion_past_the_bottom_is_not_owed_back() {
+    let mut scroll = SmoothScroll::default();
+    let start = Instant::now();
+    // Flicking down at the bottom moves nothing, then up moves at once.
+    assert_eq!(scroll.wheel(&back(0), "pane", -50., start), Some(0));
+    assert_eq!(scroll.wheel(&back(0), "pane", 0.5, start), Some(1));
+    scroll.observe(&back(0), &back(1), start);
+    assert_eq!(offset(&mut scroll, start + SPREAD), Some((-0.5, vec![1])));
+}
+
+#[test]
+fn output_while_scrolled_back_moves_the_position_not_the_picture() {
+    let mut scroll = SmoothScroll::default();
+    let start = Instant::now();
+    assert_eq!(scroll.wheel(&back(10), "pane", 1., start), Some(1));
+    scroll.observe(&back(10), &back(11), start);
+    // Three rows of output: the offset grows, the picture stays.
+    let mut grown = (*back(11)).clone();
+    grown.panes[0].scroll.as_mut().unwrap().offset_from_bottom = 14;
+    scroll.observe(&back(11), &grown, start);
+    assert_eq!(
+        offset(&mut scroll, start + SPREAD / 2),
+        Some((-0.5, vec![1]))
+    );
+    // One row scrolled while two of output arrived: the picture moved one.
+    let scrolled = surface(988, 17);
+    scroll.observe(&Arc::new(grown), &scrolled, start);
+    assert_eq!(
+        offset(&mut scroll, start + SPREAD / 2),
+        Some((-1.5, vec![1, 2]))
+    );
+}
+
+#[test]
+fn an_application_reading_the_wheel_another_boot_or_the_keyboard_ends_it() {
     let mut scroll = SmoothScroll::default();
     let now = Instant::now();
-    // Output while scrolled back: the offset grows, the picture stays.
-    scroll.observe(&surface(100, 10), &surface(100, 13), now);
-    // The rows changed without the offset: new output at the bottom.
-    scroll.observe(&surface(100, 0), &surface(98, 0), now);
-    // A jump that leaves no row on screen cannot be checked or filled.
-    scroll.observe(&surface(100, 10), &surface(94, 16), now);
-    // Another boot is another picture.
-    let mut rebooted = (*surface(98, 12)).clone();
+    let mut app = (*back(10)).clone();
+    app.panes[0].mouse_reporting = true;
+    assert_eq!(scroll.wheel(&app, "pane", 1., now), None);
+    assert_eq!(scroll.wheel(&back(10), "other", 1., now), None);
+    assert!(scroll.slide(now).is_none());
+
+    assert_eq!(scroll.wheel(&back(10), "pane", 1., now), Some(1));
+    let mut rebooted = (*back(11)).clone();
     rebooted.boot_id = "other".into();
-    scroll.observe(&surface(100, 10), &rebooted, now);
-    assert!(scroll.slides(now).is_empty());
+    scroll.observe(&back(10), &rebooted, now);
+    assert!(scroll.slide(now).is_none());
+
+    // Resting mid-row, a scroll the wheel did not ask for lands on its row.
+    assert_eq!(scroll.wheel(&back(10), "pane", 0.5, now), Some(1));
+    scroll.observe(&back(10), &back(11), now);
+    let later = now + 10 * SPREAD;
+    assert_eq!(offset(&mut scroll, later), Some((-0.5, vec![1])));
+    scroll.observe(&back(11), &back(12), later);
+    assert!(scroll.slide(later).is_none());
 }
 
 #[test]
-fn arrivals_mid_slide_continue_from_the_drawn_position_filled_by_earlier_frames() {
+fn a_dying_momentum_comes_to_rest_where_the_os_stops() {
     let mut scroll = SmoothScroll::default();
     let start = Instant::now();
-    let (a, b, c) = (surface(100, 10), surface(98, 12), surface(97, 13));
-    scroll.observe(&a, &b, start);
-    // Half way through, one more row: 1 row left over plus the new one.
-    // `b` fills one uncovered row and `a`, three rows back, the other.
-    scroll.observe(&b, &c, start + 12 * MS);
-    assert_eq!(
-        offset(&mut scroll, start + 12 * MS),
-        Some((-2., vec![1, 3]))
-    );
-    // Nearly at rest, only `b` is needed behind the next step.
-    let d = surface(96, 14);
-    scroll.observe(&c, &d, start + 34 * MS);
-    let (drawn, behind) = offset(&mut scroll, start + 34 * MS).unwrap();
-    assert!(drawn > -2. && drawn < -1., "{drawn}");
-    assert_eq!(behind, vec![1, 2]);
-    // Reversing mid-slide carries the remainder without a jump, and
-    // frames from the other direction cannot fill its edge.
-    let mut scroll = SmoothScroll::default();
-    scroll.observe(&a, &b, start);
-    scroll.observe(&b, &surface(99, 11), start + 12 * MS);
-    assert_eq!(offset(&mut scroll, start + 12 * MS), Some((0., vec![-1])));
-}
-
-#[test]
-fn an_unrelated_update_keeps_the_slide_but_changed_rows_snap_it() {
-    let mut scroll = SmoothScroll::default();
-    let start = Instant::now();
-    let (old, new) = (surface(100, 10), surface(98, 12));
-    scroll.observe(&old, &new, start);
-    let mut redrawn = (*new).clone();
-    redrawn.surface_revision += 1;
-    let redrawn = Arc::new(redrawn);
-    scroll.observe(&new, &redrawn, start + 4 * MS);
-    let slides = scroll.slides(start + 12 * MS);
-    assert_eq!(slides[0].offset, -1.);
-    assert!(Arc::ptr_eq(&slides[0].behind[0].0, &old));
-
-    let mut changed = (*redrawn).clone();
-    changed.frame.cells[0].symbol = "x".into();
-    scroll.observe(&redrawn, &changed, start + 13 * MS);
-    assert!(scroll.slides(start + 13 * MS).is_empty());
-}
-
-#[test]
-fn the_slide_duration_follows_observed_arrivals_within_bounds() {
-    let mut scroll = SmoothScroll::default();
-    let mut now = Instant::now();
-    let mut top = 1000;
-    for _ in 0..40 {
-        scroll.observe(&surface(top, 0), &surface(top - 1, 1), now);
-        now += 30 * MS;
-        top -= 1;
-    }
-    assert!(scroll.interval > 28 * MS && scroll.interval <= 30 * MS);
-    for _ in 0..40 {
-        scroll.observe(&surface(top, 0), &surface(top - 1, 1), now);
-        now += 2 * MS;
-        top -= 1;
-    }
-    assert_eq!(scroll.interval, MIN_INTERVAL);
-    // A pause starts a new gesture without stretching the next slide.
-    now += 500 * MS;
-    scroll.observe(&surface(top, 0), &surface(top - 1, 1), now);
-    assert_eq!(scroll.interval, MIN_INTERVAL);
-}
-
-#[test]
-fn decelerating_steps_keep_moving_until_the_last_one_lands() {
-    // One row per step, the gaps growing as a trackpad's momentum dies.
-    let mut scroll = SmoothScroll::default();
-    let start = Instant::now();
-    let (mut at, mut gap) = (start, 17. * 1e-3);
-    let mut steps = vec![];
-    for row in 1..=10 {
-        steps.push((at, row));
-        at += Duration::from_secs_f64(gap);
-        gap *= 1.3;
-    }
-    let frame = |row: u32| surface(1000 - row, u64::from(row));
-    let mut shown = frame(0);
-    let mut drawn = -1.;
-    let mut next = steps.iter().peekable();
-    let mut now = start;
-    let last = steps[steps.len() - 1].0;
-    while now <= last {
-        while let Some((_, row)) = next.next_if(|(at, _)| *at <= now) {
-            let landed = frame(*row);
-            scroll.observe(&shown, &landed, now);
-            shown = landed;
+    let mut shown = back(0);
+    let mut requested = vec![(start, 0)];
+    let (mut drawn, mut os) = (0., 0.);
+    let mut moving = false;
+    for ms in 0..2000 {
+        let now = start + ms * MS;
+        // A trackpad's momentum: one event a frame, decaying.
+        if ms % 8 == 0 && ms < 1200 {
+            let rows = 0.15 * (-(ms as f32) / 325.).exp();
+            os += rows;
+            let lines = scroll.wheel(&shown, "pane", rows, now).unwrap();
+            if lines != 0 {
+                let row = requested.last().unwrap().1 + u32::try_from(lines).unwrap();
+                requested.push((now, row));
+            }
+        }
+        // The daemon presents every 16 ms what was asked 4 ms earlier.
+        if ms % 16 == 4 {
+            let (_, row) = requested
+                .iter()
+                .rev()
+                .find(|(at, _)| *at + 4 * MS <= now)
+                .unwrap();
+            let next = back(*row);
+            scroll.observe(&shown, &next, now);
+            shown = next;
         }
         let row = shown.panes[0].scroll.unwrap().offset_from_bottom as f32;
         let position = row + offset(&mut scroll, now).map_or(0., |(offset, _)| offset);
-        assert!(position > drawn, "at rest {:?} in", now - start);
+        moving |= position > 0.;
+        // The last delta, at 1192 ms, is fully drawn 48 ms later.
+        let stopped = ms >= 1192 + 48;
+        assert!(!moving || stopped || position > drawn, "paused {ms} ms in");
+        assert!(position - drawn < 0.05, "snapped {ms} ms in");
         drawn = position;
-        now += MS;
     }
-    // The last step still finishes its slide rather than snapping.
-    assert!(drawn < 10.);
+    assert!((drawn - os).abs() < 1e-3, "rested at {drawn}, not {os}");
+}
+
+#[test]
+fn turning_back_moves_the_content_with_the_first_motion() {
+    let mut scroll = SmoothScroll::default();
+    let start = Instant::now();
+    // Up 0.4 rows: row 11 is asked for and the content follows to 10.4.
+    assert_eq!(scroll.wheel(&back(10), "pane", 0.4, start), Some(1));
+    scroll.observe(&back(10), &back(11), start);
+    assert_eq!(offset(&mut scroll, start + SPREAD), Some((-0.6, vec![1])));
+    // Turning back asks for row 10 at once, and the content moves down from
+    // where it is drawn rather than first unwinding the 0.6 rows ahead.
+    assert_eq!(
+        scroll.wheel(&back(11), "pane", -0.1, start + SPREAD),
+        Some(-1)
+    );
+    scroll.observe(&back(11), &back(10), start + SPREAD);
+    assert_eq!(
+        offset(&mut scroll, start + 2 * SPREAD),
+        Some((0.3, vec![-1]))
+    );
 }

@@ -32,6 +32,7 @@ mod sounds;
 mod split_drag;
 mod toast_handoff;
 mod toast_navigation;
+mod wheel_slides;
 mod window_notices;
 mod workspace_menu_navigation;
 

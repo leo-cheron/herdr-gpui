@@ -153,29 +153,31 @@ impl Render for HerdrWindow {
             cell_height,
             theme: self.theme.clone(),
         };
-        // Images paint with the whole grid, which never slides: they would
-        // stay put while the text moved. A dragged thumb places the content
-        // exactly where the pointer put it.
-        let animate = self.scrollbar_drag.is_none()
-            && surface
-                .as_ref()
-                .is_some_and(|surface| surface.graphics.placements.is_empty());
-        let slides = self.presentation.slides(Instant::now(), animate);
-        if !slides.is_empty() {
-            // Advance the slide on the next refresh through the surface signal:
-            // notifying this view would also rebuild the cached sidebar.
+        if !self.slides_allowed() {
+            self.presentation.scroll.clear();
+        }
+        let now = Instant::now();
+        let slide = self.presentation.scroll.slide(now);
+        if self.presentation.scroll.moving(now) {
+            // Advance the drawing on the next refresh through the surface
+            // signal: notifying this view would also rebuild the cached sidebar.
             let signal = self.surface_signal.clone();
             window.on_next_frame(move |_, cx| signal.update(cx, |_, cx| cx.notify()));
         }
-        let regions = self.terminal_regions(surface.as_ref(), &highlights, slides, &look, cx);
+        let regions = self.terminal_regions(surface.as_ref(), &highlights, slide, &look, cx);
         // Without regions the canvas paints the whole grid, images included.
         let whole = regions.is_empty();
         // The IME composition paints inline at the input cursor; a menu's
         // text field shows its own.
         // It anchors to the live surface, as the IME's candidate window does,
         // so a retained frame never separates the text from the window.
-        let marked = (!menu_open && !self.marked.is_empty())
-            .then(|| (self.marked.clone(), self.live.surface.clone()));
+        let marked = (!menu_open && !self.marked.is_empty()).then(|| {
+            (
+                self.marked.clone(),
+                self.live.surface.clone(),
+                self.ime_shift(),
+            )
+        });
         self.hovered_terminal_link =
             self.terminal_link_hovered(window.mouse_position(), window.modifiers());
         self.split_cursor = self.split_cursor_at(window.mouse_position());
@@ -496,7 +498,7 @@ impl Render for HerdrWindow {
                                     );
                                 }
                             }
-                            if let Some((marked, live)) = &marked {
+                            if let Some((marked, live, shift)) = &marked {
                                 let live = live.as_deref();
                                 painter.borrow().paint_composition(
                                     marked,
@@ -506,7 +508,8 @@ impl Render for HerdrWindow {
                                         cell_width,
                                         cell_height,
                                     )
-                                    .origin,
+                                    .origin
+                                        + point(px(0.), *shift),
                                     input_area(live, bounds, cell_width, cell_height),
                                     &font,
                                     window,

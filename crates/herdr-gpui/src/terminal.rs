@@ -162,10 +162,7 @@ impl WheelAccumulator {
             self.remainder = 0.;
             self.target = Some(target.clone());
         }
-        let delta = match event.delta {
-            ScrollDelta::Pixels(delta) => delta.y.to_f64() as f32 / cell_height,
-            ScrollDelta::Lines(delta) => delta.y,
-        };
+        let delta = wheel_rows(event, cell_height);
         if !delta.is_finite() {
             return 0;
         }
@@ -177,6 +174,14 @@ impl WheelAccumulator {
         let lines = total.trunc() as i16;
         self.remainder = total - f32::from(lines);
         lines
+    }
+}
+
+/// The rows `event` scrolls, up into history being positive.
+pub(crate) fn wheel_rows(event: &ScrollWheelEvent, cell_height: f32) -> f32 {
+    match event.delta {
+        ScrollDelta::Pixels(delta) => delta.y.to_f64() as f32 / cell_height,
+        ScrollDelta::Lines(delta) => delta.y,
     }
 }
 
