@@ -120,7 +120,7 @@ impl HerdrWindow {
         {
             return None;
         }
-        let (x, y) = self.grid_position(position);
+        let (x, y) = self.drawn_position(position)?;
         LinkCell::at(
             self.live.surface.as_deref()?,
             x,
@@ -137,11 +137,14 @@ impl HerdrWindow {
         {
             return false;
         }
+        let Some((x, y)) = self.drawn_position(position) else {
+            return false;
+        };
         self.live.surface.as_deref().is_some_and(|surface| {
             crate::terminal::pane_hyperlink_at(
                 surface,
-                f32::from(position.x - self.bounds.origin.x),
-                f32::from(position.y - self.bounds.origin.y),
+                x,
+                y,
                 self.cell_width,
                 self.config.terminal.line_height(),
             )

@@ -58,7 +58,7 @@ impl Presentation {
         match live.surface.clone().filter(|_| live.surface_ready()) {
             Some(ready) => {
                 if let Some(shown) = self.presented.as_ref().filter(|s| !Arc::ptr_eq(s, &ready)) {
-                    self.scroll.observe(shown, &ready, Instant::now());
+                    self.scroll.observe(shown, &ready);
                 }
                 self.presented = Some(ready);
                 self.images = live.surface_images.clone();

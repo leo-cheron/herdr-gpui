@@ -152,6 +152,13 @@ impl Render for HerdrWindow {
         }
         let now = Instant::now();
         let slide = self.presentation.scroll.slide(now);
+        // A link in a pane drawn mid-row underlines where its text is drawn.
+        let link_shift = link_rows.first().and_then(|(row, columns)| {
+            self.shift_at(point(
+                px(f32::from(columns.start) * cell_width),
+                px(f32::from(*row) * cell_height),
+            ))
+        });
         if self.presentation.scroll.moving(now) {
             // Advance the drawing on the next refresh through the surface
             // signal: notifying this view would also rebuild the cached sidebar.
@@ -459,13 +466,27 @@ impl Render for HerdrWindow {
                                     // else releases the ones that went away.
                                     painter.borrow_mut().release_idle_images(window);
                                 }
-                                painter.borrow().paint_link(
-                                    &surface.frame,
-                                    bounds.origin,
-                                    cell_width,
-                                    &link_rows,
-                                    window,
-                                );
+                                let paint_link = |window: &mut Window, shift| {
+                                    painter.borrow().paint_link(
+                                        &surface.frame,
+                                        bounds.origin + point(px(0.), shift),
+                                        cell_width,
+                                        &link_rows,
+                                        window,
+                                    )
+                                };
+                                match link_shift {
+                                    Some((pane, shift)) => window.with_content_mask(
+                                        Some(ContentMask {
+                                            bounds: Bounds::new(
+                                                bounds.origin + pane.origin,
+                                                pane.size,
+                                            ),
+                                        }),
+                                        |window| paint_link(window, shift),
+                                    ),
+                                    None => paint_link(window, px(0.)),
+                                }
                                 if let Some(popup) = &surface.popup {
                                     let offset = popup_origin(
                                         &surface.frame,

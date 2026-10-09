@@ -121,14 +121,14 @@ impl SmoothScroll {
             .take()
             .filter(|motion| motion.pane_id == pane_id && motion.rect == pane.inner_rect)
             .map(|mut motion| {
-                let drawn = motion.drawn(now);
-                // Turning back or resuming starts from what is drawn.
-                let reversed = motion
+                // Turning back starts from what is drawn. Same-direction
+                // motion keeps its target: rows still on their way are owed.
+                if motion
                     .recent
                     .back()
-                    .is_some_and(|(_, last)| last * rows < 0.);
-                if reversed || now >= motion.last + SPREAD {
-                    motion.target = drawn;
+                    .is_some_and(|(_, last)| last * rows < 0.)
+                {
+                    motion.target = motion.drawn(now);
                     motion.recent.clear();
                 }
                 motion
@@ -172,12 +172,7 @@ impl SmoothScroll {
         Some(lines as i16)
     }
 
-    pub(crate) fn observe(
-        &mut self,
-        previous: &Arc<PaneSurfaceFrame>,
-        next: &PaneSurfaceFrame,
-        now: Instant,
-    ) {
+    pub(crate) fn observe(&mut self, previous: &Arc<PaneSurfaceFrame>, next: &PaneSurfaceFrame) {
         let Some(motion) = &mut self.motion else {
             return;
         };
@@ -200,8 +195,11 @@ impl SmoothScroll {
             .filter(|shift| shift.abs() < height)
             .filter_map(|shift| i32::try_from(shift).ok())
             .find(|shift| rows_shifted(&previous.frame, &next.frame, motion.rect, *shift));
-        // A scroll the wheel did not ask for, such as the keyboard's.
-        if picture.is_some_and(|shift| shift != 0) && now >= motion.last + 2 * SPREAD {
+        // A scroll beyond the rows asked for, such as the keyboard's, ends
+        // the motion where the daemon put it, however late the answer lands.
+        let owed = motion.requested - from as i64;
+        let asked = |shift: i64| shift.signum() == owed.signum() && shift.abs() <= owed.abs();
+        if picture.is_some_and(|shift| shift != 0 && !asked(i64::from(shift))) {
             self.motion = None;
             return;
         }
@@ -273,7 +271,8 @@ impl SmoothScroll {
     }
 }
 
-/// Whether most rows of `rect` match `shift` rows down; a status line may not.
+/// Whether most of at least half the rows of `rect` match `shift` rows down,
+/// so a few blank rows never pass for a scroll; a status line may differ.
 fn rows_shifted(old: &FrameData, new: &FrameData, rect: SurfaceRect, shift: i32) -> bool {
     if old.width != new.width || old.height != new.height {
         return false;
@@ -303,7 +302,7 @@ fn rows_shifted(old: &FrameData, new: &FrameData, rect: SurfaceRect, shift: i32)
             new.is_some() && new == old.cells.get(row(y - shift))
         })
         .count();
-    rows > 0 && same * 4 >= rows * 3
+    rows > 0 && rows * 2 >= usize::from(rect.height) && same * 4 >= rows * 3
 }
 
 #[cfg(test)]

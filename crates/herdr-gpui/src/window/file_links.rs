@@ -174,7 +174,7 @@ impl HerdrWindow {
         {
             return None;
         }
-        let (x, y) = self.grid_position(position);
+        let (x, y) = self.drawn_position(position)?;
         let link = pane_link_at(
             self.live.surface.as_deref()?,
             x,

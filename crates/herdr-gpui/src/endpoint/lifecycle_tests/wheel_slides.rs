@@ -83,3 +83,68 @@ fn placement() -> SurfaceGraphicsPlacement {
         scrollback_offset: 0,
     }
 }
+
+/// A pane resting a quarter row into history shows, in the sliver at its
+/// bottom edge, a row the live surface does not hold: no link resolves there,
+/// while clicks and selection keep the edge row.
+#[gpui::test]
+fn the_uncovered_edge_of_a_resting_pane_resolves_no_link(cx: &mut gpui::TestAppContext) {
+    let (fixture, cx) = cx.add_window_view(|window, cx| {
+        Fixture(cx.new(|cx| crate::sidebar::layout_tests::fixture_window(window, cx)))
+    });
+    let view = fixture.update(cx, |fixture, _| fixture.0.clone());
+    let (endpoint, _server) = connected_endpoint("ssh:wheel");
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            prepare_mouse(view, endpoint, cx);
+            let scroll = |offset| PaneSurfaceScrollMetrics {
+                offset_from_bottom: offset,
+                max_offset_from_bottom: 1000,
+                viewport_rows: 22,
+            };
+            let surface = Arc::make_mut(view.live.surface.as_mut().unwrap());
+            surface.panes[0].mouse_reporting = false;
+            surface.panes[0].scroll = Some(scroll(0));
+            // Rows that differ, so the daemon's next frame reads as a scroll.
+            let frame = &mut surface.frame;
+            frame.cells = (0..frame.height)
+                .flat_map(|y| (0..frame.width).map(move |x| (x, y)))
+                .map(|(x, y)| CellData {
+                    symbol: if x == 2 { y.to_string() } else { " ".into() },
+                    fg: 0,
+                    bg: 0,
+                    modifier: 0,
+                    skip: false,
+                    hyperlink: None,
+                })
+                .collect();
+            view.presentation.frame(&view.live);
+            let quarter = view.config.terminal.line_height() / 4.;
+            view.scroll_wheel(
+                &ScrollWheelEvent {
+                    position: mouse_position(view, 3.5, 4.5),
+                    delta: ScrollDelta::Pixels(point(px(0.), px(quarter))),
+                    touch_phase: TouchPhase::Moved,
+                    ..Default::default()
+                },
+                window,
+                cx,
+            );
+            // The daemon shows the row the wheel asked for: its rows move down.
+            let surface = Arc::make_mut(view.live.surface.as_mut().unwrap());
+            surface.panes[0].scroll = Some(scroll(1));
+            let width = usize::from(surface.frame.width);
+            surface.frame.cells.rotate_right(width);
+            view.presentation.frame(&view.live);
+            let (middle, edge) = (
+                mouse_position(view, 3.5, 2.5),
+                mouse_position(view, 3.5, 22.9),
+            );
+            assert!(view.drawn_position(middle).is_some());
+            assert_eq!(view.drawn_position(edge), None);
+            let height = view.config.terminal.line_height();
+            let (_, y) = view.grid_position(edge);
+            assert_eq!((y / height).floor(), 22., "clicks keep the edge row");
+        });
+    });
+}

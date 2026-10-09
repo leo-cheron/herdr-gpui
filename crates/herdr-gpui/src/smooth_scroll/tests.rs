@@ -84,7 +84,7 @@ fn the_pane_is_drawn_where_the_os_put_it_and_rests_there() {
     // Entering row 11 asks the daemon for it at once.
     assert_eq!(scroll.wheel(&a, "pane", 0.25, start), Some(1));
     // Asked one row ahead, the daemon shows row 11; row 10 fills behind it.
-    scroll.observe(&a, &b, start);
+    scroll.observe(&a, &b);
     assert_eq!(offset(&mut scroll, start), Some((-1., vec![1])));
     assert_eq!(
         offset(&mut scroll, start + 24 * MS),
@@ -112,13 +112,13 @@ fn rows_no_surface_showed_are_never_drawn() {
     let start = Instant::now();
     // The OS is 2.5 rows on, the daemon one: the drawing waits at row 11.
     assert_eq!(scroll.wheel(&back(10), "pane", 2.5, start), Some(3));
-    scroll.observe(&back(10), &back(11), start);
+    scroll.observe(&back(10), &back(11));
     assert_eq!(offset(&mut scroll, start + SPREAD), Some((0., vec![])));
     // A changing status row still lets the picture be followed, so a step
     // back, resuming from the row drawn, draws from the frames behind.
     let mut status = (*back(12)).clone();
     status.frame.cells[usize::from(ROWS - 1) * 4].symbol = "x".into();
-    scroll.observe(&back(11), &status, start);
+    scroll.observe(&back(11), &status);
     assert_eq!(scroll.wheel(&status, "pane", -1., start + SPREAD), Some(-2));
     assert_eq!(
         offset(&mut scroll, start + 2 * SPREAD),
@@ -129,7 +129,7 @@ fn rows_no_surface_showed_are_never_drawn() {
     for cell in &mut changed.frame.cells[8..] {
         cell.symbol = "x".into();
     }
-    scroll.observe(&Arc::new(status), &changed, start + SPREAD);
+    scroll.observe(&Arc::new(status), &changed);
     assert_eq!(offset(&mut scroll, start + 2 * SPREAD), None);
     // Back the other way, nothing has shown the rows below.
     assert_eq!(
@@ -146,7 +146,7 @@ fn motion_past_the_bottom_is_not_owed_back() {
     // Flicking down at the bottom moves nothing, then up moves at once.
     assert_eq!(scroll.wheel(&back(0), "pane", -50., start), Some(0));
     assert_eq!(scroll.wheel(&back(0), "pane", 0.5, start), Some(1));
-    scroll.observe(&back(0), &back(1), start);
+    scroll.observe(&back(0), &back(1));
     assert_eq!(offset(&mut scroll, start + SPREAD), Some((-0.5, vec![1])));
 }
 
@@ -155,21 +155,22 @@ fn output_while_scrolled_back_moves_the_position_not_the_picture() {
     let mut scroll = SmoothScroll::default();
     let start = Instant::now();
     assert_eq!(scroll.wheel(&back(10), "pane", 1., start), Some(1));
-    scroll.observe(&back(10), &back(11), start);
+    scroll.observe(&back(10), &back(11));
     // Three rows of output: the offset grows, the picture stays.
     let mut grown = (*back(11)).clone();
     grown.panes[0].scroll.as_mut().unwrap().offset_from_bottom = 14;
-    scroll.observe(&back(11), &grown, start);
+    scroll.observe(&back(11), &grown);
     assert_eq!(
         offset(&mut scroll, start + SPREAD / 2),
         Some((-0.5, vec![1]))
     );
-    // One row scrolled while two of output arrived: the picture moved one.
+    // Another row asked for scrolls one while two of output arrive.
+    assert_eq!(scroll.wheel(&grown, "pane", 1., start), Some(1));
     let scrolled = surface(988, 17);
-    scroll.observe(&Arc::new(grown), &scrolled, start);
+    scroll.observe(&Arc::new(grown), &scrolled);
     assert_eq!(
         offset(&mut scroll, start + SPREAD / 2),
-        Some((-1.5, vec![1, 2]))
+        Some((-1., vec![1]))
     );
 }
 
@@ -186,15 +187,15 @@ fn an_application_reading_the_wheel_another_boot_or_the_keyboard_ends_it() {
     assert_eq!(scroll.wheel(&back(10), "pane", 1., now), Some(1));
     let mut rebooted = (*back(11)).clone();
     rebooted.boot_id = "other".into();
-    scroll.observe(&back(10), &rebooted, now);
+    scroll.observe(&back(10), &rebooted);
     assert!(scroll.slide(now).is_none());
 
     // Resting mid-row, a scroll the wheel did not ask for lands on its row.
     assert_eq!(scroll.wheel(&back(10), "pane", 0.5, now), Some(1));
-    scroll.observe(&back(10), &back(11), now);
+    scroll.observe(&back(10), &back(11));
     let later = now + 10 * SPREAD;
     assert_eq!(offset(&mut scroll, later), Some((-0.5, vec![1])));
-    scroll.observe(&back(11), &back(12), later);
+    scroll.observe(&back(11), &back(12));
     assert!(scroll.slide(later).is_none());
 }
 
@@ -226,7 +227,7 @@ fn a_dying_momentum_comes_to_rest_where_the_os_stops() {
                 .find(|(at, _)| *at + 4 * MS <= now)
                 .unwrap();
             let next = back(*row);
-            scroll.observe(&shown, &next, now);
+            scroll.observe(&shown, &next);
             shown = next;
         }
         let row = shown.panes[0].scroll.unwrap().offset_from_bottom as f32;
@@ -247,7 +248,7 @@ fn turning_back_moves_the_content_with_the_first_motion() {
     let start = Instant::now();
     // Up 0.4 rows: row 11 is asked for and the content follows to 10.4.
     assert_eq!(scroll.wheel(&back(10), "pane", 0.4, start), Some(1));
-    scroll.observe(&back(10), &back(11), start);
+    scroll.observe(&back(10), &back(11));
     assert_eq!(offset(&mut scroll, start + SPREAD), Some((-0.6, vec![1])));
     // Turning back asks for row 10 at once, and the content moves down from
     // where it is drawn rather than first unwinding the 0.6 rows ahead.
@@ -255,9 +256,46 @@ fn turning_back_moves_the_content_with_the_first_motion() {
         scroll.wheel(&back(11), "pane", -0.1, start + SPREAD),
         Some(-1)
     );
-    scroll.observe(&back(11), &back(10), start + SPREAD);
+    scroll.observe(&back(11), &back(10));
     assert_eq!(
         offset(&mut scroll, start + 2 * SPREAD),
         Some((0.3, vec![-1]))
     );
+}
+
+#[test]
+fn a_late_answer_keeps_every_notch_and_the_rest() {
+    let mut scroll = SmoothScroll::default();
+    let start = Instant::now();
+    // Two notches 60 ms apart, both before the daemon answers the first.
+    assert_eq!(scroll.wheel(&back(10), "pane", 1., start), Some(1));
+    let later = start + 60 * MS;
+    assert_eq!(scroll.wheel(&back(10), "pane", 1., later), Some(1));
+    // Both answers land long after; neither is mistaken for the keyboard.
+    scroll.observe(&back(10), &back(11));
+    scroll.observe(&back(11), &back(12));
+    assert_eq!(offset(&mut scroll, later + 10 * SPREAD), None);
+    assert_eq!(scroll.wheel(&back(12), "pane", 0.5, later), Some(1));
+    scroll.observe(&back(12), &back(13));
+    assert_eq!(
+        offset(&mut scroll, later + 10 * SPREAD),
+        Some((-0.5, vec![1]))
+    );
+}
+
+#[test]
+fn a_few_blank_rows_never_pass_for_a_scroll() {
+    let blank = |rows: [&str; 6]| {
+        let mut frame = (*back(10)).clone();
+        for (y, text) in rows.iter().enumerate() {
+            for (x, c) in format!("{text:>4}").chars().enumerate() {
+                frame.frame.cells[y * 4 + x].symbol = c.to_string();
+            }
+        }
+        frame.frame
+    };
+    let old = blank(["", "a", "b", "c", "d", ""]);
+    let new = blank(["", "e", "f", "g", "h", ""]);
+    let rect = back(10).panes[0].inner_rect;
+    assert!((-5..=5).all(|shift| !rows_shifted(&old, &new, rect, shift)));
 }

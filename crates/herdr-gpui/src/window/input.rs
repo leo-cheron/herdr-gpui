@@ -84,12 +84,13 @@ impl HerdrWindow {
     }
 
     /// Whether wheel scrolling may draw panes between rows. Images paint with
-    /// the whole grid, which never slides, and a dragged thumb places the
-    /// content exactly where the pointer put it.
+    /// the whole grid, which never slides, a dragged thumb places the content
+    /// exactly where the pointer put it, and a popup stays on its rows.
     pub(crate) fn slides_allowed(&self) -> bool {
         self.scrollbar_drag.is_none()
-            && (self.live.surface.as_ref())
-                .is_none_or(|surface| surface.graphics.placements.is_empty())
+            && (self.live.surface.as_ref()).is_none_or(|surface| {
+                surface.graphics.placements.is_empty() && surface.popup.is_none()
+            })
     }
 
     /// The pane drawn mid-row after a wheel scroll, in pixels from the grid's
@@ -110,32 +111,47 @@ impl HerdrWindow {
         Some((pane, px(offset * cell_height)))
     }
 
-    /// `position` in the terminal grid's pixels. Over a pane drawn mid-row
-    /// after a wheel scroll, it is where that content sits in the grid, so
-    /// clicks, selection, and links land on the row they are drawn on; the
-    /// sliver uncovered at the pane's edge belongs to its edge row.
-    pub(crate) fn grid_position(&self, position: Point<Pixels>) -> (f32, f32) {
+    /// How far below its grid position the content at grid pixel `cell` is
+    /// drawn, with the pane that clips it.
+    pub(crate) fn shift_at(&self, cell: Point<Pixels>) -> Option<(Bounds<Pixels>, Pixels)> {
+        self.scroll_shift().filter(|(pane, _)| pane.contains(&cell))
+    }
+
+    /// `position` in the terminal grid's pixels where the content drawn there
+    /// sits, and whether the live surface holds it: the sliver uncovered at a
+    /// pane's edge shows a row from an earlier frame, mapped to the edge row.
+    fn drawn_at(&self, position: Point<Pixels>) -> ((f32, f32), bool) {
         let mut grid = position - self.bounds.origin;
-        if let Some((pane, shift)) = self.scroll_shift().filter(|(pane, _)| pane.contains(&grid)) {
-            grid.y = (grid.y - shift).clamp(pane.top(), pane.bottom() - px(1.));
+        let mut held = true;
+        if let Some((pane, shift)) = self.shift_at(grid) {
+            grid.y -= shift;
+            held = pane.contains(&grid);
+            grid.y = grid.y.clamp(pane.top(), pane.bottom() - px(1.));
         }
-        (f32::from(grid.x), f32::from(grid.y))
+        ((f32::from(grid.x), f32::from(grid.y)), held)
+    }
+
+    /// `position` in the terminal grid's pixels, for clicks and selection.
+    pub(crate) fn grid_position(&self, position: Point<Pixels>) -> (f32, f32) {
+        self.drawn_at(position).0
+    }
+
+    /// `position` in the terminal grid's pixels, or `None` over a row the live
+    /// surface does not hold, so links never resolve against another row.
+    pub(crate) fn drawn_position(&self, position: Point<Pixels>) -> Option<(f32, f32)> {
+        let (grid, held) = self.drawn_at(position);
+        held.then_some(grid)
     }
 
     /// How far below its grid cell the input cursor is drawn, which an IME
-    /// composition and its candidate window follow: the cursor's pane may
-    /// rest mid-row after a wheel scroll. A popup never slides.
+    /// composition and its candidate window follow.
     pub(crate) fn ime_shift(&self) -> Pixels {
-        let Some(cursor) = (self.live.surface.as_deref())
-            .filter(|surface| surface.popup.is_none())
-            .and_then(|surface| surface.frame.cursor.as_ref())
+        let Some(cursor) = (self.live.surface.as_deref()).and_then(|s| s.frame.cursor.as_ref())
         else {
             return px(0.);
         };
         let cell = cursor_offset(cursor, self.cell_width, self.config.terminal.line_height());
-        self.scroll_shift()
-            .filter(|(pane, _)| pane.contains(&cell))
-            .map_or(px(0.), |(_, shift)| shift)
+        self.shift_at(cell).map_or(px(0.), |(_, shift)| shift)
     }
 
     pub(crate) fn terminal_link_at(&self, position: Point<Pixels>) -> Option<String> {
@@ -145,7 +161,7 @@ impl HerdrWindow {
         {
             return None;
         }
-        let (x, y) = self.grid_position(position);
+        let (x, y) = self.drawn_position(position)?;
         crate::terminal::link_at(
             self.live.surface.as_deref()?,
             x,
