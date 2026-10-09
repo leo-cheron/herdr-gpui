@@ -2580,10 +2580,10 @@ records when reporting the failure.
   the presented surface and the earlier ones that showed them. When the
   gesture stops part-way into a row, the pane rests there; clicks, selection,
   and links target the cells where they are drawn. Applications reading the
-  wheel, a dragged scrollbar thumb, a frame placing images, keyboard scrolling,
-  and any change to the pane's rows besides the scroll move the content to the
-  daemon's whole row. Only the moving pane repaints; other panes replay their
-  cached paint.
+  wheel, a dragged scrollbar thumb, a frame placing images, an open popup,
+  keyboard scrolling, and any change to the pane's rows besides the scroll move
+  the content to the daemon's whole row. Only the moving pane repaints; other
+  panes replay their cached paint.
 - Direct semantic cell canvas: named ANSI colors, indexed 256-color palette,
   RGB, reset foreground/background, reverse, dim, hidden, bold, italic,
   underline, strikeout, wide-cell skip handling, and cursor shapes.
