@@ -95,7 +95,7 @@ fn the_pane_is_drawn_where_the_os_put_it_and_rests_there() {
     let later = start + 100 * SPREAD;
     assert_eq!(offset(&mut scroll, later), Some((-0.75, vec![1])));
     // Hit testing targets the cells where they are drawn.
-    assert_eq!(scroll.offset(later), Some((b.panes[0].inner_rect, -0.75)));
+    assert_eq!(scroll.offset(), Some((b.panes[0].inner_rect, -0.75)));
     // A resting pane is not redrawn, and resumes from where it is drawn.
     assert!(!scroll.moving(later));
     assert_eq!(scroll.wheel(&b, "pane", 0.125, later), Some(0));
@@ -295,6 +295,53 @@ fn turning_back_before_an_answer_keeps_the_rest_between_rows() {
     scroll.observe(&back(11), &back(9));
     let (offset, _) = offset(&mut scroll, start + 10 * SPREAD).unwrap();
     assert!((offset - 0.9).abs() < 1e-4, "{offset}");
+}
+
+#[test]
+fn requests_served_together_never_answer_a_later_scroll() {
+    let mut scroll = SmoothScroll::default();
+    let now = Instant::now();
+    // 10 → 11, 11 → 8, 8 → 13, before any surface.
+    assert_eq!(scroll.wheel(&back(10), "pane", 1., now), Some(1));
+    assert_eq!(scroll.wheel(&back(10), "pane", -1.5, now), Some(-3));
+    assert_eq!(scroll.wheel(&back(10), "pane", 2.5, now), Some(5));
+    // One surface shows row 11; the keyboard then moves to row 10.
+    scroll.observe(&back(10), &back(11));
+    scroll.observe(&back(11), &back(10));
+    assert!(scroll.slide(now).is_none());
+}
+
+#[test]
+fn a_long_wait_for_answers_keeps_every_row_asked() {
+    let mut scroll = SmoothScroll::default();
+    let now = Instant::now();
+    for _ in 0..MAX_RECENT + 2 {
+        assert_eq!(scroll.wheel(&back(10), "pane", 1., now), Some(1));
+    }
+    // The first answer finally lands, on the first row asked.
+    scroll.observe(&back(10), &back(11));
+    assert!(scroll.slide(now).is_some());
+}
+
+#[test]
+fn output_into_blank_rows_keeps_the_rest_between_rows() {
+    let blank = |n| {
+        let mut surface = (*back(n)).clone();
+        for cell in &mut surface.frame.cells {
+            cell.symbol = " ".into();
+        }
+        Arc::new(surface)
+    };
+    let mut scroll = SmoothScroll::default();
+    let start = Instant::now();
+    assert_eq!(scroll.wheel(&blank(10), "pane", 0.5, start), Some(1));
+    scroll.observe(&blank(10), &blank(11));
+    let later = start + 10 * SPREAD;
+    assert_eq!(offset(&mut scroll, later), Some((-0.5, vec![1])));
+    // Two lines of output while scrolled back: every shift matches blank
+    // rows, and only the one nobody asked for is not taken.
+    scroll.observe(&blank(11), &blank(13));
+    assert_eq!(offset(&mut scroll, later), Some((-0.5, vec![1])));
 }
 
 #[test]

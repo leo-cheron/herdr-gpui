@@ -14,7 +14,6 @@ use gpui::{
     Bounds, Context, KeyDownEvent, KeyUpEvent, Pixels, Point, ScrollWheelEvent, Window, point, px,
     size,
 };
-use std::time::Instant;
 
 impl HerdrWindow {
     pub(crate) fn open_terminal_link(
@@ -96,7 +95,7 @@ impl HerdrWindow {
     /// The pane drawn mid-row after a wheel scroll, in pixels from the grid's
     /// origin, and how far below its grid position its content is drawn.
     fn scroll_shift(&self) -> Option<(Bounds<Pixels>, Pixels)> {
-        let (rect, offset) = self.presentation.scroll.offset(Instant::now())?;
+        let (rect, offset) = self.presentation.scroll.offset()?;
         let (cell_width, cell_height) = (self.cell_width, self.config.terminal.line_height());
         let pane = Bounds::new(
             point(
@@ -208,6 +207,8 @@ impl HerdrWindow {
         };
         if let Some(lines) = smooth {
             steps.lines = lines;
+            // The motion is spent here; the whole-line path must not count it again.
+            self.wheel.drop_lines();
         }
         cx.stop_propagation();
         for input in target.wheel_events(steps, event.modifiers) {
@@ -215,6 +216,8 @@ impl HerdrWindow {
                 ConnectionBridge::send_input(handle, &snapshot.boot_id, &target.target, input);
             if let Err(error) = result {
                 self.local_error = Some(format!("Wheel input not sent: {error}"));
+                // The rows asked for never left, so nothing may wait on them.
+                self.presentation.scroll.clear();
                 cx.notify();
                 break;
             }

@@ -50,6 +50,8 @@ struct Motion {
     pending: VecDeque<(i64, i64)>,
     recent: VecDeque<(Instant, f64)>,
     last: Instant,
+    /// The offset last painted, which hit testing follows.
+    painted: f32,
     /// Earlier surfaces with their offsets, newest first.
     behind: Vec<(Arc<PaneSurfaceFrame>, u64)>,
 }
@@ -146,6 +148,7 @@ impl SmoothScroll {
             pending: VecDeque::new(),
             recent: VecDeque::new(),
             last: now,
+            painted: 0.,
             behind: Vec::new(),
         }));
         let max = scroll.max_offset_from_bottom as f64;
@@ -176,8 +179,18 @@ impl SmoothScroll {
             .pending
             .push_back((motion.requested, motion.requested + lines));
         motion.requested += lines;
-        if motion.pending.len() > MAX_RECENT {
-            motion.pending.pop_front();
+        // Merged, the oldest two requests still cover every row either asked.
+        if motion.pending.len() > MAX_RECENT
+            && let (Some((a, b)), Some((_, c))) =
+                (motion.pending.pop_front(), motion.pending.pop_front())
+        {
+            let (low, high) = (a.min(b).min(c), a.max(b).max(c));
+            let merged = if a - low <= high - a {
+                (low, high)
+            } else {
+                (high, low)
+            };
+            motion.pending.push_front(merged);
         }
         Some(lines as i16)
     }
@@ -199,33 +212,37 @@ impl SmoothScroll {
         let moved = to as i64 - from as i64;
         let height = i64::from(motion.rect.height);
         let nearest = moved.max(1 - height).min(height - 1);
-        let picture = (0..2 * height)
+        let shifts = (0..2 * height)
             .flat_map(|distance| [nearest - distance, nearest + distance])
             .skip(1) // `nearest` itself comes twice
             .filter(|shift| shift.abs() < height)
-            .filter_map(|shift| i32::try_from(shift).ok())
-            .find(|shift| rows_shifted(&previous.frame, &next.frame, motion.rect, *shift));
-        // A scroll to a row never asked for, such as the keyboard's, ends the
-        // motion where the daemon put it, however late the answer lands.
-        let landed = picture
-            .filter(|shift| *shift != 0)
-            .map(|shift| from as i64 + i64::from(shift));
-        let answer = landed.map(|landed| {
-            let along = |(a, b): &(i64, i64)| a.min(b) <= &landed && &landed <= a.max(b);
-            motion.pending.iter().position(along)
-        });
-        if let Some(None) = answer {
+            .filter_map(|shift| i32::try_from(shift).ok());
+        let matches = |shift: &i32| rows_shifted(&previous.frame, &next.frame, motion.rect, *shift);
+        // Repeated rows can match several shifts: output alone, or a row the
+        // wheel asked for, is preferred. A scroll to a row never asked for,
+        // such as the keyboard's, ends the motion where the daemon put it,
+        // however late the answer lands.
+        let answer = |shift: i32| match shift {
+            0 => Some(None),
+            _ => answered(&motion.pending, from as i64 + i64::from(shift)).map(Some),
+        };
+        let asked = shifts
+            .clone()
+            .filter_map(|shift| Some((shift, answer(shift)?)))
+            .find(|(shift, _)| matches(shift));
+        if asked.is_none() && shifts.clone().any(|shift| matches(&shift)) {
             self.motion = None;
             return;
         }
+        let picture = asked.map(|(shift, _)| shift);
         if let Some(shift) = picture {
             let output = moved - i64::from(shift);
             motion.target += output as f64;
             motion.requested += output;
-            if let (Some(landed), Some(Some(answer))) = (landed, answer) {
+            if let Some((shift, Some(answer))) = asked {
                 motion.pending.drain(..answer);
                 if let Some(first) = motion.pending.front_mut() {
-                    first.0 = landed;
+                    first.0 = from as i64 + i64::from(shift);
                 }
             }
             for (start, end) in &mut motion.pending {
@@ -256,19 +273,21 @@ impl SmoothScroll {
             .is_some_and(|motion| now < motion.last + SPREAD)
     }
 
-    /// The pane's rect and offset, for hit testing.
-    pub(crate) fn offset(&self, now: Instant) -> Option<(SurfaceRect, f32)> {
+    /// The pane's rect and the offset last painted, for hit testing.
+    pub(crate) fn offset(&self) -> Option<(SurfaceRect, f32)> {
         let motion = self.motion.as_ref()?;
-        Some((motion.rect, motion.offset(now)))
+        Some((motion.rect, motion.painted))
     }
 
     pub(crate) fn slide(&mut self, now: Instant) -> Option<Slide> {
-        let motion = self.motion.as_ref()?;
-        let offset = motion.offset(now);
-        if motion.target == motion.shown as f64 && !self.moving(now) {
+        let moving = self.moving(now);
+        let motion = self.motion.as_mut()?;
+        if motion.target == motion.shown as f64 && !moving {
             self.motion = None;
             return None;
         }
+        let offset = motion.offset(now);
+        motion.painted = offset;
         let mut behind: Vec<_> = motion
             .behind
             .iter()
@@ -295,6 +314,14 @@ impl SmoothScroll {
     pub(crate) fn clear(&mut self) {
         self.motion = None;
     }
+}
+
+/// The last request along which the daemon `landed`, which retires every
+/// one before it: a surface can show several requests served at once.
+fn answered(pending: &VecDeque<(i64, i64)>, landed: i64) -> Option<usize> {
+    pending
+        .iter()
+        .rposition(|&(a, b)| a.min(b) <= landed && landed <= a.max(b))
 }
 
 /// Whether most of at least half the rows of `rect` match `shift` rows down,

@@ -223,6 +223,12 @@ impl WheelAccumulator {
         };
         WheelSteps { lines, columns }
     }
+
+    /// Forgets the vertical motion kept between events, once another path
+    /// has consumed it.
+    pub(crate) fn drop_lines(&mut self) {
+        self.lines = WheelRemainder::default();
+    }
 }
 
 /// The rows `event` scrolls, up into history being positive.
