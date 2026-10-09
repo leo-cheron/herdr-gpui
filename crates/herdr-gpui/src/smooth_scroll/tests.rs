@@ -301,11 +301,11 @@ fn turning_back_before_an_answer_keeps_the_rest_between_rows() {
 fn requests_served_together_never_answer_a_later_scroll() {
     let mut scroll = SmoothScroll::default();
     let now = Instant::now();
-    // 10 → 11, 11 → 8, 8 → 13, before any surface.
+    // 10 → 11, 11 → 9, 9 → 11, before any surface.
     assert_eq!(scroll.wheel(&back(10), "pane", 1., now), Some(1));
-    assert_eq!(scroll.wheel(&back(10), "pane", -1.5, now), Some(-3));
-    assert_eq!(scroll.wheel(&back(10), "pane", 2.5, now), Some(5));
-    // One surface shows row 11; the keyboard then moves to row 10.
+    assert_eq!(scroll.wheel(&back(10), "pane", -0.5, now), Some(-2));
+    assert_eq!(scroll.wheel(&back(10), "pane", 0.5, now), Some(2));
+    // One surface serves all three; the keyboard then moves to row 10.
     scroll.observe(&back(10), &back(11));
     scroll.observe(&back(11), &back(10));
     assert!(scroll.slide(now).is_none());
@@ -360,3 +360,5 @@ fn a_few_blank_rows_never_pass_for_a_scroll() {
     let rect = back(10).panes[0].inner_rect;
     assert!((-5..=5).all(|shift| !rows_shifted(&old, &new, rect, shift)));
 }
+
+mod model;

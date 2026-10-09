@@ -237,14 +237,19 @@ impl SmoothScroll {
         let picture = asked.map(|(shift, _)| shift);
         if let Some(shift) = picture {
             let output = moved - i64::from(shift);
-            motion.target += output as f64;
-            motion.requested += output;
-            if let Some((shift, Some(answer))) = asked {
+            let landed = from as i64 + i64::from(shift);
+            // Requests served together, even ones that cancel out, land on
+            // the last row asked for; none may wait to answer a later scroll.
+            if landed == motion.requested {
+                motion.pending.clear();
+            } else if let Some((_, Some(answer))) = asked {
                 motion.pending.drain(..answer);
                 if let Some(first) = motion.pending.front_mut() {
-                    first.0 = from as i64 + i64::from(shift);
+                    first.0 = landed;
                 }
             }
+            motion.target += output as f64;
+            motion.requested += output;
             for (start, end) in &mut motion.pending {
                 *start += output;
                 *end += output;
@@ -316,12 +321,12 @@ impl SmoothScroll {
     }
 }
 
-/// The last request along which the daemon `landed`, which retires every
-/// one before it: a surface can show several requests served at once.
+/// The first request along which the daemon `landed`, which retires every
+/// one before it: the daemon answers in order.
 fn answered(pending: &VecDeque<(i64, i64)>, landed: i64) -> Option<usize> {
     pending
         .iter()
-        .rposition(|&(a, b)| a.min(b) <= landed && landed <= a.max(b))
+        .position(|&(a, b)| a.min(b) <= landed && landed <= a.max(b))
 }
 
 /// Whether most of at least half the rows of `rect` match `shift` rows down,
