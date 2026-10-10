@@ -15,16 +15,24 @@ impl Rng {
     }
 }
 
-/// The daemon's view of the pane: the row at its top, and its offset.
+/// The daemon's view of the pane: the row at its top, its offset, and
+/// whether every row reads alike, so the picture matches any shift.
 #[derive(Clone, Copy)]
 struct Daemon {
     top: u32,
     offset: u64,
+    blank: bool,
 }
 
 impl Daemon {
     fn surface(self) -> Arc<PaneSurfaceFrame> {
-        surface(self.top, self.offset)
+        let mut surface = surface(self.top, self.offset);
+        if self.blank {
+            for cell in &mut Arc::make_mut(&mut surface).frame.cells {
+                cell.symbol = " ".into();
+            }
+        }
+        surface
     }
 
     /// Scrolling `lines` into history moves the content down as many rows.
@@ -40,6 +48,7 @@ fn run(seed: u64) {
     let mut daemon = Daemon {
         top: 500,
         offset: 500,
+        blank: seed.is_multiple_of(2),
     };
     let mut presented = daemon.surface();
     let mut in_flight: VecDeque<i64> = VecDeque::new();

@@ -3,7 +3,7 @@
 //! rows no surface showed are never drawn. The pane rests where the gesture
 //! stops, and hit testing follows (`HerdrWindow::grid_position`).
 
-use herdr_client::protocol::{FrameData, PaneSurfaceFrame, SurfaceRect};
+use herdr_client::protocol::{FrameData, PaneSurfaceFrame, PaneSurfaceScrollMetrics, SurfaceRect};
 use std::{
     collections::VecDeque,
     sync::Arc,
@@ -57,13 +57,12 @@ struct Motion {
 }
 
 impl Motion {
-    fn scrolled(&self, surface: &PaneSurfaceFrame) -> Option<u64> {
+    fn scrolled(&self, surface: &PaneSurfaceFrame) -> Option<PaneSurfaceScrollMetrics> {
         surface
             .panes
             .iter()
             .find(|pane| pane.pane_id == self.pane_id && pane.inner_rect == self.rect)?
             .scroll
-            .map(|scroll| scroll.offset_from_bottom)
     }
 
     fn drawn(&self, now: Instant) -> f64 {
@@ -207,42 +206,37 @@ impl SmoothScroll {
             self.motion = None;
             return;
         };
-        // The picture's shift may differ from the offset's when output
-        // arrives while scrolled back; the nearest shifts are tried first.
+        let grown = to.max_offset_from_bottom as i64 - from.max_offset_from_bottom as i64;
+        let (from, to) = (from.offset_from_bottom, to.offset_from_bottom);
+        // Output grows the history and moves a scrolled-back offset without
+        // moving the picture, so the picture's expected shift, then the
+        // nearest ones, are tried first: repeated rows can match several.
         let moved = to as i64 - from as i64;
         let height = i64::from(motion.rect.height);
-        let nearest = moved.max(1 - height).min(height - 1);
-        let shifts = (0..2 * height)
+        let nearest = (moved - grown.max(0)).max(1 - height).min(height - 1);
+        let picture = (0..2 * height)
             .flat_map(|distance| [nearest - distance, nearest + distance])
             .skip(1) // `nearest` itself comes twice
             .filter(|shift| shift.abs() < height)
-            .filter_map(|shift| i32::try_from(shift).ok());
-        let matches = |shift: &i32| rows_shifted(&previous.frame, &next.frame, motion.rect, *shift);
-        // Repeated rows can match several shifts: output alone, or a row the
-        // wheel asked for, is preferred. A scroll to a row never asked for,
-        // such as the keyboard's, ends the motion where the daemon put it,
-        // however late the answer lands.
-        let answer = |shift: i32| match shift {
-            0 => Some(None),
-            _ => answered(&motion.pending, from as i64 + i64::from(shift)).map(Some),
-        };
-        let asked = shifts
-            .clone()
-            .filter_map(|shift| Some((shift, answer(shift)?)))
-            .find(|(shift, _)| matches(shift));
-        if asked.is_none() && shifts.clone().any(|shift| matches(&shift)) {
+            .filter_map(|shift| i32::try_from(shift).ok())
+            .find(|shift| rows_shifted(&previous.frame, &next.frame, motion.rect, *shift));
+        // A scroll to a row never asked for, such as the keyboard's, ends the
+        // motion where the daemon put it, however late the answer lands.
+        let landed = picture.map(|shift| from as i64 + i64::from(shift));
+        let answer = landed
+            .filter(|_| picture != Some(0))
+            .map(|landed| answered(&motion.pending, landed));
+        if let Some(None) = answer {
             self.motion = None;
             return;
         }
-        let picture = asked.map(|(shift, _)| shift);
-        if let Some(shift) = picture {
+        if let (Some(shift), Some(landed)) = (picture, landed) {
             let output = moved - i64::from(shift);
-            let landed = from as i64 + i64::from(shift);
             // Requests served together, even ones that cancel out, land on
             // the last row asked for; none may wait to answer a later scroll.
             if landed == motion.requested {
                 motion.pending.clear();
-            } else if let Some((_, Some(answer))) = asked {
+            } else if let Some(Some(answer)) = answer {
                 motion.pending.drain(..answer);
                 if let Some(first) = motion.pending.front_mut() {
                     first.0 = landed;

@@ -5,7 +5,8 @@ use herdr_client::protocol::{CellData, PaneSurfacePane, PaneSurfaceScrollMetrics
 const ROWS: u16 = 6;
 const MS: Duration = Duration::from_millis(1);
 
-/// A one-pane surface whose row `y` reads `top + y`, scrolled back `offset`.
+/// A one-pane surface whose row `y` reads `top + y`, scrolled back `offset`;
+/// rows are numbered from the start of history, so output grows `top + offset`.
 fn surface(top: u32, offset: u64) -> Arc<PaneSurfaceFrame> {
     let cells = (0..ROWS)
         .flat_map(|y| {
@@ -48,7 +49,7 @@ fn surface(top: u32, offset: u64) -> Arc<PaneSurfaceFrame> {
             scrollbar_rect: None,
             scroll: Some(PaneSurfaceScrollMetrics {
                 offset_from_bottom: offset,
-                max_offset_from_bottom: 1000,
+                max_offset_from_bottom: u64::from(top) + offset,
                 viewport_rows: u64::from(ROWS),
             }),
             focused: true,
@@ -324,9 +325,9 @@ fn a_long_wait_for_answers_keeps_every_row_asked() {
 }
 
 #[test]
-fn output_into_blank_rows_keeps_the_rest_between_rows() {
-    let blank = |n| {
-        let mut surface = (*back(n)).clone();
+fn blank_rows_tell_output_from_a_scroll() {
+    let blank = |top, offset| {
+        let mut surface = (*surface(top, offset)).clone();
         for cell in &mut surface.frame.cells {
             cell.symbol = " ".into();
         }
@@ -334,14 +335,17 @@ fn output_into_blank_rows_keeps_the_rest_between_rows() {
     };
     let mut scroll = SmoothScroll::default();
     let start = Instant::now();
-    assert_eq!(scroll.wheel(&blank(10), "pane", 0.5, start), Some(1));
-    scroll.observe(&blank(10), &blank(11));
+    assert_eq!(scroll.wheel(&blank(990, 10), "pane", 0.5, start), Some(1));
+    scroll.observe(&blank(990, 10), &blank(989, 11));
     let later = start + 10 * SPREAD;
     assert_eq!(offset(&mut scroll, later), Some((-0.5, vec![1])));
-    // Two lines of output while scrolled back: every shift matches blank
-    // rows, and only the one nobody asked for is not taken.
-    scroll.observe(&blank(11), &blank(13));
+    // Two lines of output while scrolled back grow the history and keep
+    // the rest, though every shift matches blank rows.
+    scroll.observe(&blank(989, 11), &blank(989, 13));
     assert_eq!(offset(&mut scroll, later), Some((-0.5, vec![1])));
+    // The keyboard's row through them leaves the history as it was: it lands.
+    scroll.observe(&blank(989, 13), &blank(988, 14));
+    assert!(scroll.slide(later).is_none());
 }
 
 #[test]
