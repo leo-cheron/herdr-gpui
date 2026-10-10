@@ -42,7 +42,9 @@ impl Daemon {
     }
 }
 
-fn run(seed: u64) {
+/// Runs one seed, returning how many steps were checked and how many were
+/// exempt as ambiguous.
+fn run(seed: u64) -> (u32, u32) {
     let mut rng = Rng(seed);
     let mut scroll = SmoothScroll::default();
     let mut daemon = Daemon {
@@ -54,8 +56,9 @@ fn run(seed: u64) {
     let mut in_flight: VecDeque<i64> = VecDeque::new();
     // A partial answer on the last row asked for reads as all of them,
     // which no row can tell apart: the pane lands, and the answers still in
-    // flight read as unasked until they drain.
-    let mut ambiguous = false;
+    // flight would read as unasked. That one surface goes unchecked, and the
+    // scenario restarts from the daemon once it has served the rest.
+    let (mut checked, mut exempt) = (0, 0);
     let mut trace = Vec::new();
     let mut now = Instant::now();
     for step in 0..400 {
@@ -85,7 +88,7 @@ fn run(seed: u64) {
                 for lines in in_flight.drain(..served) {
                     daemon.scroll(lines);
                 }
-                ambiguous |= !in_flight.is_empty() && daemon.offset as i64 == last;
+                let ambiguous = !in_flight.is_empty() && daemon.offset as i64 == last;
                 let output = rng.below(4) == 0;
                 if output {
                     // Herdr keeps a scrolled-back view where it is.
@@ -98,9 +101,19 @@ fn run(seed: u64) {
                     "serve {served} output {output}: at {}, {in_flight:?} left",
                     daemon.offset
                 ));
+                if ambiguous {
+                    exempt += 1;
+                    for lines in in_flight.drain(..) {
+                        daemon.scroll(lines);
+                    }
+                    presented = daemon.surface();
+                    scroll.clear();
+                    trace.push(format!("ambiguous: restart at {}", daemon.offset));
+                    continue;
+                }
                 // An answer never ends the motion or moves its target,
                 // beyond what the output adds.
-                if let (Some(before), false) = (before, ambiguous) {
+                if let Some(before) = before {
                     let target = scroll.motion.as_ref().map(|motion| motion.target);
                     let expected = before + f64::from(u8::from(output));
                     assert_eq!(target, Some(expected), "{}", fail(&trace));
@@ -118,27 +131,27 @@ fn run(seed: u64) {
                 presented = next;
                 trace.push(format!("keyboard {lines}: at {}", daemon.offset));
                 // A row the wheel never asked for lands where the daemon put it.
-                if let (Some(motion), false) = (&scroll.motion, ambiguous) {
+                if let Some(motion) = &scroll.motion {
                     assert_eq!(motion.target, motion.shown as f64, "{}", fail(&trace));
                 }
             }
             _ => {}
         }
-        if ambiguous {
-            ambiguous = !in_flight.is_empty() || scroll.motion.is_some();
-            continue;
-        }
         // The motion heads where the daemon will be once it has served all.
+        checked += 1;
         if let Some(motion) = &scroll.motion {
             let headed = daemon.offset as i64 + in_flight.iter().sum::<i64>();
             assert_eq!(motion.requested, headed, "{}", fail(&trace));
         }
     }
+    (checked, exempt)
 }
 
 #[test]
 fn the_wheel_keeps_in_step_with_a_daemon_that_answers_in_its_own_time() {
-    for seed in 1..=500 {
-        run(seed);
-    }
+    let (checked, exempt) = (1..=500)
+        .map(run)
+        .fold((0, 0), |(c, e), (rc, re)| (c + rc, e + re));
+    // About 2% of steps hit the ambiguity; most must stay checked.
+    assert!(exempt * 20 < checked, "{exempt} of {checked} steps exempt");
 }
